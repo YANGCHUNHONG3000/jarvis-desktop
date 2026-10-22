@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "document-numeric-report",
+  "version": 1,
+  "name": "Word表格第二列转数值求和并生成报告",
+  "recipe": "document_numeric_report",
+  "sum_columns": [1],
+  "draft": false
+}

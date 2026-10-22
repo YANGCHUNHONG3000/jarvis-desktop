@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "document-table-office-package",
+  "version": 1,
+  "name": "Word表格转Excel与报告",
+  "recipe": "document_table_report",
+  "sum_columns": [],
+  "draft": false
+}
