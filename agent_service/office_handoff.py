@@ -49,11 +49,23 @@ def latest_generated_outputs(*, base=BASE, task_base=TASK_BASE, stop=lambda: Fal
         if safe_root(session).parent != base:
             raise ComputerError('office_handoff_history_invalid')
         outcomes.extend((p.stat().st_mtime_ns, p) for p in (session/'goals').glob('*.run/outcome.json'))
+        outcomes.extend((p.stat().st_mtime_ns, p) for p in (session/'goals').glob('*.capability/outcome.json'))
     for _, path in sorted(outcomes, key=lambda item:(item[0], str(item[1])), reverse=True)[:100]:
         if stop():
             raise ComputerError('office_handoff_cancelled')
         if safe_root(path).parent.parent.parent.parent != base:
             raise ComputerError('office_handoff_history_invalid')
+        if path.parent.name.endswith('.capability'):
+            from .capability_router import inspect_saved
+            outcome = inspect_saved(path.parent, task_base=task_base, computer_base=base)
+            artifacts = outcome['artifacts']
+            if not artifacts:
+                continue
+            if outcome['ok'] is not True or not 1 <= len(artifacts) <= MAX_EDIT_FILES:
+                raise ComputerError('office_handoff_history_invalid')
+            records = [{'path': item['path'], 'sha256': item['sha256']} for item in artifacts]
+            select_outputs(records, base=task_base)
+            return records
         outcome = read_record(path)
         if type(outcome) is not dict:
             raise ComputerError('office_handoff_history_invalid')

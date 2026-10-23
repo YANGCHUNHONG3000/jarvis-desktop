@@ -51,7 +51,7 @@ def _identity(task, base, store, *, current):
             or type(info["sha256"]) is not str or not _HASH.fullmatch(info["sha256"])
             or type(info["implementation_sha256"]) is not str
             or not _HASH.fullmatch(info["implementation_sha256"])
-            or info["mode"] != "active" or parent["state"] != "cancelled"
+            or info["mode"] not in {"active", "trial"} or parent["state"] != "cancelled"
             or parent["ok"] is not False):
         raise SkillResumeError("skill_resume_parent_invalid")
     request = workflow._read_json(task / "skill-request.json")
@@ -66,10 +66,23 @@ def _identity(task, base, store, *, current):
             raise SkillResumeError("skill_resume_request_invalid")
     snapshot = ordinary._snapshot(task, base)
     workflow_root = snapshot["workflow_root"]
-    if (request != {"manifest": candidate, "sha256": info["sha256"],
-                    "implementation_sha256": info["implementation_sha256"],
-                    "mode": "active", "executor": "supervised_office",
-                    "workflow_root": str(workflow_root)}):
+    expected_request = {"manifest": candidate, "sha256": info["sha256"],
+                        "implementation_sha256": info["implementation_sha256"],
+                        "mode": info["mode"], "executor": "supervised_office",
+                        "workflow_root": str(workflow_root)}
+    binding = request.get("source_retry")
+    from .adapter_development import external_trial_binding
+    development_binding = external_trial_binding(task, base, store)
+    if development_binding is not None and binding != development_binding:
+        raise SkillResumeError("skill_resume_source_changed")
+    if binding is not None:
+        if (type(binding) is not dict or set(binding) != {"task_root", "token"}
+                or any(type(binding[key]) is not str for key in binding)):
+            raise SkillResumeError("skill_resume_source_changed")
+        expected_request["source_retry"] = binding
+        from .gap_recovery import verify_prepared_origin
+        verify_prepared_origin(task, base)
+    if request != expected_request:
         raise SkillResumeError("skill_resume_request_invalid")
     original_count = snapshot["original_completed"]
     if not 1 <= original_count < len(snapshot["steps"]):
@@ -86,7 +99,7 @@ def _identity(task, base, store, *, current):
             or run.get("completed") != original_ids
             or run.get("receipts") != {key: snapshot["receipts"][key] for key in original_ids}):
         raise SkillResumeError("skill_resume_boundary_invalid")
-    if current:
+    if current and info["mode"] == "active":
         state = skills._state(root, info["id"])
         if (state["active"] is not None or state["inflight"] is not None
                 or state["remaining_runs"] != 0 or info["sha256"] not in state["blocked"]):
@@ -145,11 +158,16 @@ def _evidence(task, base, store, *, current, archived=None):
             raise SkillResumeError("skill_resume_changed")
         source = workflow._read_json(task / "sources" / "source.json")
         source = skills._prepared_snapshot(task, source, base)
+        origin = task / "retry-origin.json"
+        if origin.exists() or skills._linked(origin):
+            from .gap_recovery import verify_prepared_origin
+            verify_prepared_origin(task, base)
         if skills.build_steps(candidate, source) != snapshot["steps"]:
             raise SkillResumeError("skill_resume_plan_changed")
         for gate in ("offline.json", "review.json"):
             skills._gate_file(version, gate, info["sha256"])
-        skills._live_check(version, info["sha256"], base)
+        if info["mode"] == "active":
+            skills._live_check(version, info["sha256"], base)
     _native_prefix(snapshot, original_count)
     files = {
         "result.json": original_hash,
@@ -161,14 +179,18 @@ def _evidence(task, base, store, *, current, archived=None):
     }
     if current:
         files["store/manifest.json"] = _digest(version / "manifest.json")
-        files["store/active.json"] = _digest(root / info["id"] / "active.json")
-        for gate in ("offline.json", "review.json", "live.json"):
+        for gate in ("offline.json", "review.json"):
             files["store/" + gate] = _digest(version / gate)
+        if info["mode"] == "active":
+            files["store/active.json"] = _digest(root / info["id"] / "active.json")
+            files["store/live.json"] = _digest(version / "live.json")
     else:
         if type(archived) is not dict or type(archived.get("files")) is not dict:
             raise SkillResumeError("skill_resume_permit_invalid")
-        for name in ("store/manifest.json", "store/active.json", "store/offline.json",
-                     "store/review.json", "store/live.json"):
+        names = ["store/manifest.json", "store/offline.json", "store/review.json"]
+        if info["mode"] == "active":
+            names += ["store/active.json", "store/live.json"]
+        for name in names:
             value = archived["files"].get(name)
             if type(value) is not str or not _HASH.fullmatch(value):
                 raise SkillResumeError("skill_resume_permit_invalid")
@@ -191,6 +213,7 @@ def _evidence(task, base, store, *, current, archived=None):
         files[f"workflow/{step_id}/artifact"] = _digest(Path(receipt["artifact"]), 20_000_000)
     return {"schema": 1, "task_root": str(task), "workflow_root": str(snapshot["workflow_root"]),
             "store_root": str(root), "skill_id": info["id"], "candidate_sha256": info["sha256"],
+            "mode": info["mode"],
             "implementation_sha256": info["implementation_sha256"],
             "original_sha256": original_hash, "manifest_sha256": snapshot["manifest_sha256"],
             "completed": original_count, "total": len(snapshot["steps"]),

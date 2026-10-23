@@ -52,10 +52,27 @@ def _inventory_shape(value):
 
 def validate_manifest(value):
     """Validate only bounded JSON shape; do not resolve or read any path."""
+    if type(value) is dict and type(value.get('version')) is int and value['version'] == 5:
+        from .comparison_compact_seed import validate_manifest as validate_compact
+        return validate_compact(value)
+    if type(value) is dict and type(value.get('version')) is int and value['version'] == 2:
+        from .comparison_research_seed import validate_manifest as validate_research
+        return validate_research(value)
+    if type(value) is dict and type(value.get('version')) is int and value['version'] == 3:
+        from .comparison_recovered_seed import validate_manifest as validate_recovered
+        return validate_recovered(value)
+    if type(value) is dict and type(value.get('version')) is int and value['version'] == 4:
+        from .comparison_failed_seed import validate_manifest as validate_failed
+        return validate_failed(value)
+    return _validate_shape(value, version=1, require_lifecycle=True)
+
+
+def _validate_shape(value, *, version, require_lifecycle, empty_outputs=False):
+    """Shared pure shape checks; producer-specific ownership is checked on load."""
     fields = {'version', 'run', 'queries', 'plan_sha256', 'outcome_sha256',
               'inventory', 'outputs', 'source_ids', 'sources'}
     if (type(value) is not dict or set(value) != fields
-            or type(value['version']) is not int or value['version'] != 1
+            or type(value['version']) is not int or value['version'] != version
             or not _plain(value['run'], 2000)
             or not _hash_value(value['plan_sha256'])
             or not _hash_value(value['outcome_sha256'])):
@@ -66,11 +83,14 @@ def validate_manifest(value):
             or len({q.strip().casefold() for q in queries}) != len(queries)):
         _fail()
     _inventory_shape(value['inventory'])
+    required = {'claim.json', 'environment-goal.json'}
+    if require_lifecycle:
+        required.update({'owner.json', 'owner.lease'})
     if (value['inventory'].get('outcome.json') != value['outcome_sha256']
-            or not {'claim.json', 'owner.json', 'owner.lease', 'environment-goal.json'}
-            <= value['inventory'].keys()):
+            or not required <= value['inventory'].keys()):
         _fail()
-    if type(value['outputs']) is not dict or not 1 <= len(value['outputs']) <= 2:
+    if (type(value['outputs']) is not dict or
+            (value['outputs'] != {} if empty_outputs else not 1 <= len(value['outputs']) <= 2)):
         _fail()
     for path, inventory in value['outputs'].items():
         if not _plain(path, 2000):
@@ -139,6 +159,11 @@ def _freeze(root):
     """Rehash every run and native-output byte, including cache-hit loads."""
     from .run_lifecycle import assert_inactive
     assert_inactive(root)
+    return _snapshot(root)
+
+
+def _snapshot(root):
+    """Bounded byte snapshot; caller must first check its producer ownership."""
     inventory = _inventory(root)
     plan_hash = _hash(root.with_suffix('.json'))
     outcome = read_record(root / 'outcome.json')
@@ -170,6 +195,15 @@ def _verified(root, frozen):
     version = plan['goal'].get('comparison', {}).get('evidence_version')
     if 'recovery' in plan or version not in {3, 4}:
         _fail()
+    comparison = plan['goal'].get('comparison', {})
+    imported = None
+    if 'capture_import' in comparison:
+        from .comparison_capture_import import fingerprint
+        imported = fingerprint(comparison['capture_import'], comparison.get('seed'))
+
+    def check_import():
+        if imported is not None and fingerprint(comparison['capture_import'], comparison.get('seed')) != imported:
+            raise ComputerError('comparison_seed_changed')
     environment_type = CompletionEnvironment
     if version == 4:
         from .comparison_crosssite import CrossSiteEnvironment
@@ -185,10 +219,12 @@ def _verified(root, frozen):
         # A v4 cache entry depends on its v3 ancestor too. Rehash and validate
         # that original seed before returning any cached child source records.
         load_seed(ancestor)
-    key = digest(frozen)
+    key = digest(frozen) if imported is None else digest({'run': frozen, 'capture_import': imported})
     if key in _CACHE:
+        result = deepcopy(_CACHE[key])
+        check_import()
         _CACHE.move_to_end(key)
-        return deepcopy(_CACHE[key])
+        return result
     # AgentEnvironment.__init__ can create environment-goal.json when absent.
     # Reconstruct its read-only fields instead, so even concurrent removal can
     # only fail verification and can never cause a write to the historical run.
@@ -243,6 +279,7 @@ def _verified(root, frozen):
               'sources': sources, 'evidence_version': version}
     if _freeze(root) != frozen:
         raise ComputerError('comparison_seed_changed')
+    check_import()
     _CACHE[key] = deepcopy(result)
     while len(_CACHE) > 4:
         _CACHE.popitem(last=False)
@@ -266,6 +303,16 @@ def create_manifest(run, source_ids=None):
     """Freeze selected captures from a completed v3/v4 run, without claiming it."""
     try:
         root = _run_root(run)
+        plan = read_record(root.with_suffix('.json'))
+        if type(plan.get('goal')) is dict and 'comparison' not in plan['goal']:
+            from .comparison_research_seed import create_manifest as create_research
+            return create_research(root, source_ids)
+        if read_record(root / 'outcome.json').get('ok') is False:
+            from .comparison_failed_seed import create_manifest as create_failed
+            return create_failed(root, source_ids)
+        if 'recovery' in plan:
+            from .comparison_recovered_seed import create_manifest as create_recovered
+            return create_recovered(root, source_ids)
         frozen = _freeze(root)
         verified = _verified(root, frozen)
         ids = deepcopy(verified['active_ids'] if source_ids is None else source_ids)
@@ -287,6 +334,18 @@ def load_seed(manifest):
     """Return original candidate/read pairs only after local immutable replay."""
     try:
         manifest = validate_manifest(manifest)
+        if manifest['version'] == 5:
+            from .comparison_compact_seed import load_seed as load_compact
+            return load_compact(manifest)
+        if manifest['version'] == 4:
+            from .comparison_failed_seed import load_seed as load_failed
+            return load_failed(manifest)
+        if manifest['version'] == 2:
+            from .comparison_research_seed import load_seed as load_research
+            return load_research(manifest)
+        if manifest['version'] == 3:
+            from .comparison_recovered_seed import load_seed as load_recovered
+            return load_recovered(manifest)
         root = _run_root(manifest['run'])
         frozen = _freeze(root)
         if any(manifest[name] != value for name, value in frozen.items()):

@@ -23,12 +23,26 @@ CONTEXT_LIMIT = 1_048_576
 MAX_OUTPUT = 2048
 # CNY / million tokens == integer micro-CNY / token. Peak, uncached ceilings.
 INPUT_RATE, OUTPUT_RATE = 2, 8
+PROMPT_FRAMING_ALLOWANCE = 4096
 DEFAULT_TASK_SECONDS = 390
 MIN_PAID_WINDOW_SECONDS = 10
 
 
 class ModelError(ValueError):
     """Only stable, non-secret codes may reach logs/UI."""
+
+
+def request_token_bound(encoded):
+    """Conservative bound for this client's two text messages, not a token count.
+
+    The inspected official V4 tokenizer is byte-level BPE with no expanding
+    normalizer. Full JSON bytes overcount message text/escapes; the allowance
+    covers role, JSON-output and generation framing. Tools/images/thinking are
+    not supported here. Returned usage is checked, and violations halt billing.
+    """
+    if type(encoded) is not bytes or not encoded:
+        raise ModelError('model_input_invalid')
+    return len(encoded) + PROMPT_FRAMING_ALLOWANCE
 
 
 def checked_prices(html):
@@ -150,7 +164,11 @@ class CloudClient:
                                                 {"role": "user", "content": user}],
                 "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"},
                 "max_tokens": max_tokens, "stream": False}
-        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        try:
+            encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except UnicodeError:
+            raise ModelError('model_input_invalid') from None
+        prompt_bound = request_token_bound(encoded)
         try:
             key = self.key_path.read_text(encoding="utf-8").strip()
         except OSError:
@@ -185,13 +203,16 @@ class CloudClient:
                     or type(meta.get("max_output_tokens")) is not int
                     or meta["max_output_tokens"] < max_tokens):
                 raise ModelError("model_limits_changed")
-            reserve = CONTEXT_LIMIT * INPUT_RATE + max_tokens * OUTPUT_RATE
+            if prompt_bound + max_tokens > meta['context_window']:
+                raise ModelError('model_input_exceeds_context')
+            reserve = prompt_bound * INPUT_RATE + max_tokens * OUTPUT_RATE
             self._check_deadline(minimum=MIN_PAID_WINDOW_SECONDS)
             self._check_cancelled()
             reservation = self.ledger.reserve(reserve, sha256(encoded).hexdigest())
             self.calls += 1
             self.last_call = {"reservation_id": reservation, "model": MODEL,
-                              "reserved_micro": reserve, "prices": prices, "state": "pending"}
+                              "reserved_micro": reserve, "prices": prices, "state": "pending",
+                              "budget_policy": "request_utf8_v1", "prompt_token_bound": prompt_bound}
             session.cookies.clear()
             started = self.clock()
             self._check_cancelled()
@@ -206,9 +227,16 @@ class CloudClient:
             prompt, completion, total = (usage.get(name) for name in
                                           ("prompt_tokens", "completion_tokens", "total_tokens"))
             if (any(type(n) is not int or n < 0 for n in (prompt, completion, total))
-                    or prompt > CONTEXT_LIMIT or completion > max_tokens or total != prompt + completion):
+                    or total != prompt + completion):
                 raise ModelError("model_usage_invalid")
             cost = prompt * INPUT_RATE + completion * OUTPUT_RATE
+            if cost > 9_223_372_036_854_775_807:
+                raise ModelError('model_usage_invalid')
+            accounted_usage = {'prompt_tokens': prompt, 'completion_tokens': completion, 'total_tokens': total}
+            if prompt > prompt_bound or completion > max_tokens or total > meta['context_window']:
+                self.ledger.settle_anomaly(reservation, cost, accounted_usage, reason='request_bound_exceeded')
+                self.last_call.update(state='accounting_fault', charged_micro=cost, usage=accounted_usage)
+                raise ModelError('model_usage_exceeds_request_bound')
             self.ledger.settle(reservation, cost, {"prompt_tokens": prompt,
                                                   "completion_tokens": completion, "total_tokens": total})
             self.last_call.update(state="settled", charged_micro=cost, usage=usage,

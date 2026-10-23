@@ -6,10 +6,16 @@ import pytest
 import requests
 
 from agent_service.budget import BudgetLedger
-from agent_service.model import API, MODEL, PRICING, CloudClient, ModelError, checked_prices
+from agent_service.model import (API, MODEL, PRICING, CloudClient, ModelError, checked_prices,
+                                request_token_bound, PROMPT_FRAMING_ALLOWANCE)
 
 
 FAKE_KEY = "test-key-never-real"
+
+
+def posted_reserve(session, index=0):
+    raw = session.posts[index][1]['data']
+    return (len(raw) + PROMPT_FRAMING_ALLOWANCE) * 2 + json.loads(raw)['max_tokens'] * 8
 
 
 @pytest.mark.parametrize('stage', ['initial', 'prices', 'models'])
@@ -155,7 +161,10 @@ def test_paid_post_follows_reservation_and_valid_verification(local_client):
     session = FakeSession(on_post=lambda: held_at_post.append(ledger.snapshot()["held_micro"]))
     client = make(session)
     assert client.complete("system", "user", max_tokens=1024) == {"answer": "ok"}
-    assert held_at_post == [1_048_576 * 2 + 1024 * 8]
+    assert held_at_post == [posted_reserve(session)]
+    assert held_at_post[0] < 20_000
+    assert client.last_call['budget_policy'] == 'request_utf8_v1'
+    assert client.last_call['prompt_token_bound'] == len(session.posts[0][1]['data']) + 4096
     assert ledger.snapshot()["charged_micro"] == 10 * 2 + 5 * 8
     assert ledger.snapshot()["held_micro"] == 0
     assert [url for url, _ in session.gets] == [PRICING, API + "/models"]
@@ -213,8 +222,8 @@ def test_permission_missing_blocks_all_http_even_with_fake_key(local_client):
                                      "total_tokens": 14},
                                     {"prompt_tokens": 10.0, "completion_tokens": 5,
                                      "total_tokens": 15},
-                                    {"prompt_tokens": 10, "completion_tokens": 3000,
-                                     "total_tokens": 3010}])
+                                    {"prompt_tokens": True, "completion_tokens": 5,
+                                     "total_tokens": 6}])
 def test_invalid_usage_keeps_reservation(local_client, usage):
     make, ledger, _ = local_client
     session = FakeSession(result=completion(usage=usage))
@@ -222,7 +231,7 @@ def test_invalid_usage_keeps_reservation(local_client, usage):
     with pytest.raises(ModelError):
         client.complete("system", "user")
     assert len(session.posts) == 1
-    assert ledger.snapshot()["held_micro"] == 1_048_576 * 2 + 1024 * 8
+    assert ledger.snapshot()["held_micro"] == posted_reserve(session)
     assert ledger.snapshot()["charged_micro"] == 0
     assert client.last_call["state"] == "pending"
 
@@ -240,7 +249,7 @@ def test_network_failure_and_post_deadline_keep_reservation(local_client):
     with pytest.raises(ModelError, match="model_deadline"):
         make(timed, clock=clock).complete("system", "user")
     assert timed.responses[-1].closed
-    assert ledger.snapshot()["held_micro"] == 2 * (1_048_576 * 2 + 1024 * 8)
+    assert ledger.snapshot()["held_micro"] == posted_reserve(failed) + posted_reserve(timed)
 
 
 def test_bad_json_after_valid_usage_still_charges(local_client):
@@ -264,8 +273,8 @@ def test_max_tokens_boundary_and_six_call_ceiling(local_client, monkeypatch):
             make(session).complete("system", "user", max_tokens=bad)
         assert session.gets == session.posts == []
 
-    monkeypatch.setattr(model, "CONTEXT_LIMIT", 1000)
-    session = FakeSession(metadata=model_metadata(context_window=1000))
+    monkeypatch.setattr(model, "CONTEXT_LIMIT", 10000)
+    session = FakeSession(metadata=model_metadata(context_window=10000))
     client = make(session)
     for _ in range(6):
         assert client.complete("system", "user", max_tokens=2048) == {"answer": "ok"}
@@ -338,7 +347,8 @@ def test_deadline_after_reserve_prevents_post_and_keeps_hold(local_client, monke
     with pytest.raises(ModelError, match="model_deadline"):
         client.complete("system", "user")
     assert session.posts == []
-    assert ledger.snapshot()["held_micro"] == 1_048_576 * 2 + 1024 * 8
+    assert ledger.snapshot()["held_micro"] == client.last_call['reserved_micro']
+    assert client.last_call['reserved_micro'] < 20_000
     assert client.last_call["state"] == "pending"
 
 
@@ -359,4 +369,89 @@ def test_paid_post_crossing_task_deadline_keeps_hold(local_client):
         make(session, clock=clock, deadline=20).complete("system", "user")
     assert len(session.posts) == 1
     assert session.responses[-1].closed
-    assert ledger.snapshot()["held_micro"] == 1_048_576 * 2 + 1024 * 8
+    assert ledger.snapshot()["held_micro"] == posted_reserve(session)
+
+
+@pytest.mark.parametrize('text', ['ascii JSON', '中文表格 JSON', '🧪é\u0301\\\n<think> JSON'])
+def test_request_bound_uses_final_utf8_body_including_json_and_framing(local_client, text):
+    make, _, _ = local_client
+    session = FakeSession()
+    client = make(session)
+    client.complete('system without format instruction', text, max_tokens=64)
+    raw = session.posts[0][1]['data']; body = json.loads(raw)
+    assert request_token_bound(raw) == len(raw) + 4096
+    assert client.last_call['reserved_micro'] == (len(raw) + 4096) * 2 + 64 * 8
+    assert set(body) == {'model', 'messages', 'response_format', 'thinking', 'max_tokens', 'stream'}
+    assert [m['role'] for m in body['messages']] == ['system', 'user']
+    assert all(set(m) == {'role', 'content'} for m in body['messages'])
+
+
+def test_small_request_runs_with_old_unknown_hold_and_less_than_full_context_balance(local_client):
+    make, ledger, _ = local_client
+    unknown = ledger.reserve(2_101_248, 'old-unknown')
+    # Match the real stricter rolling-window balance, not just calendar-day spend.
+    settled = ledger.reserve(799_392, 'old-charged')
+    ledger.settle(settled, 799_392, {})
+    assert ledger.snapshot()['remaining_micro'] == 2_099_360
+    client = make()
+    assert client.complete('JSON', 'Return a status', max_tokens=64) == {'answer': 'ok'}
+    assert client.last_call['reserved_micro'] < 20_000
+    assert ledger.snapshot()['held_micro'] == 2_101_248
+    with ledger._transaction(write=False) as db:
+        assert db.execute('SELECT charge_micro FROM reservations WHERE id=?', (unknown,)).fetchone() == (None,)
+
+
+def test_request_cost_still_blocks_when_remaining_budget_is_too_small(local_client):
+    from agent_service.budget import BudgetError
+    make, ledger, _ = local_client
+    ledger.reserve(4_999_999, 'other-pending-call')
+    session = FakeSession()
+    with pytest.raises(BudgetError):
+        make(session).complete('JSON', 'one step')
+    assert not session.posts and ledger.snapshot()['held_micro'] == 4_999_999
+
+
+def test_actual_context_fit_is_checked_before_reservation(local_client):
+    make, ledger, _ = local_client
+    session = FakeSession(metadata=model_metadata(context_window=4000))
+    with pytest.raises(ModelError, match='model_input_exceeds_context'):
+        make(session).complete('JSON', 'one step')
+    assert not session.posts and ledger.snapshot()['held_micro'] == 0
+
+
+@pytest.mark.parametrize('case', ['prompt', 'completion', 'absolute_context', 'extra_field'])
+def test_credible_bound_violation_is_charged_and_persistently_stops_new_calls(local_client, case):
+    from agent_service.budget import BudgetError, BudgetLedger
+    make, ledger, _ = local_client
+    session = FakeSession()
+    def set_usage():
+        prompt = (1_048_577 if case == 'absolute_context' else
+                  request_token_bound(session.posts[0][1]['data']) + 1 if case == 'prompt' else 10)
+        output = 0 if case in ('prompt', 'absolute_context') else 3000
+        session.result = completion(usage={'prompt_tokens':prompt, 'completion_tokens':output,
+                                           'total_tokens':prompt + output})
+        if case == 'extra_field':
+            session.result['usage']['extension'] = float('nan')
+    session.on_post = set_usage
+    client = make(session)
+    with pytest.raises(ModelError, match='model_usage_exceeds_request_bound'):
+        client.complete('JSON', 'one step')
+    cost = client.last_call['charged_micro']
+    assert (cost < client.last_call['reserved_micro']) == (case == 'prompt')
+    assert ledger.snapshot()['charged_micro'] == cost
+    assert ledger.snapshot()['held_micro'] == 0 and ledger.snapshot()['remaining_micro'] == 0
+    assert client.last_call['state'] == 'accounting_fault'
+    assert set(client.last_call['usage']) == {'prompt_tokens', 'completion_tokens', 'total_tokens'}
+    # A fresh instance also refuses new paid dispatch after the durable fault.
+    another = FakeSession()
+    with pytest.raises(BudgetError, match='accounting fault'):
+        make(another).complete('JSON', 'one step')
+    assert not another.posts
+
+
+def test_invalid_unicode_rejected_without_network_or_hold(local_client):
+    make, ledger, _ = local_client
+    session = FakeSession()
+    with pytest.raises(ModelError, match='model_input_invalid'):
+        make(session).complete('JSON', '\ud800')
+    assert not session.gets and not session.posts and ledger.snapshot()['held_micro'] == 0

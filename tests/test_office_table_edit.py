@@ -122,11 +122,11 @@ def test_preservation_independently_checks_exact_original_table_text(tmp_path):
         edit.verify_preservation(path, output, spec)
 
 
-def test_complex_table_paragraph_readonly_and_other_cell_still_editable(tmp_path):
+def test_cross_run_table_rewrite_rejected_and_other_cell_still_editable(tmp_path):
     path, root, source, spec = prepared(tmp_path, complex_cell=True)
-    assert source['observed']['table_cells'][2]['editable'] is False
+    assert source['observed']['table_cells'][2]['editable'] is True
     spec['changes'][0]['before'] = '第二段复杂'
-    with pytest.raises(edit.EditError, match='edit_before_mismatch'):
+    with pytest.raises(edit.EditError, match='edit_word_complex'):
         edit._bind(spec, root)
     spec['changes'][0].update(column_index=0, paragraph_index=0, before='相同')
     edit._bind(spec, root)
@@ -202,6 +202,8 @@ def native_protocol_document(observed):
 
 
 def install_simulated_com(monkeypatch, owned):
+    owned.close_calls=[]
+    owned.Close=lambda save:owned.close_calls.append(save)
     app = SimpleNamespace(Name='simulated COM protocol', Version='test-only',
                           Documents=SimpleNamespace(Open=lambda *args, **kwargs: owned))
     client = SimpleNamespace(DispatchEx=lambda progid: app)

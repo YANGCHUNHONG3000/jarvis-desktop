@@ -85,11 +85,11 @@ def test_merged_continuation_and_nested_aliases_are_not_targets(tmp_path, coordi
         edit._word_paragraph(tree, spec['changes'][0])
 
 
-def test_complex_nested_runs_remain_readonly(tmp_path):
+def test_cross_run_nested_rewrite_refused(tmp_path):
     _, root, source, spec = prepared_complex(tmp_path, complex_run=True)
-    assert edit._word_observed_item(source['observed'], spec['changes'][3])['editable'] is False
-    spec['changes'] = [dict(spec['changes'][3], before='Nested复杂')]
-    with pytest.raises(edit.EditError, match='edit_before_mismatch'):
+    assert edit._word_observed_item(source['observed'], spec['changes'][3])['editable'] is True
+    spec['changes'] = [dict(spec['changes'][3], before='Nested复杂', after='全段改写')]
+    with pytest.raises(edit.EditError, match='edit_word_complex'):
         edit._bind(spec, root)
 
 

@@ -258,11 +258,15 @@ def _extract(snapshot, receipt, index, source_file):
     return kind, data, coverage
 
 
-def snapshot_artifact_source(ref, task_root, base, *, stop=lambda:False, deadline=None) -> dict:
+def snapshot_artifact_source(ref, task_root, base, *, stop=lambda:False, deadline=None,
+                             full_workbook=False) -> dict:
     """Revalidate the selected receipt and copy its bytes before any model call."""
     if type(ref) is dict and ref.get('kind') == 'office_edit':
         from .edited_artifact_source import snapshot_reference
-        return snapshot_reference(ref, task_root, base, stop=stop, deadline=deadline)
+        return snapshot_reference(ref, task_root, base, stop=stop, deadline=deadline,
+                                  full_workbook=full_workbook)
+    if full_workbook:
+        raise ArtifactSourceError('artifact_workbook_source_requires_verified_edit')
     ref = _reference(ref)
     if office_source._linked(task_root) or office_source._linked(base):
         raise ArtifactSourceError("artifact_source_task_invalid")

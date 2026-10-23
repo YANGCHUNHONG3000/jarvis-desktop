@@ -58,6 +58,8 @@ def prepare(session, instruction, goal):
     if 'comparison' in goal:
         if goal['comparison'].get('evidence_version') != 4:
             goal['comparison']['evidence_version'] = 3
+        from .publisher_evidence import POLICY
+        goal['comparison']['publisher_policy'] = POLICY
     return _save_goal(session, {'schema':3, 'mode':'agent', 'instruction':instruction,
              'goal':goal, 'max_actions':MAX_ACTIONS,
              'max_seconds':MAX_SECONDS, 'prepared_at':time.time()})
@@ -154,6 +156,10 @@ def describe(plan):
                     '；缺证时沿真实网页链接有界跨站补查，导航链接不作为发布方归属证明。'
                     '最多六个活动页、两轮复核；每个独立来源组各维度均有据才生成Office。')
                 lines[5] = '历史来源不重读；最多两次补查、八个候选，祖先合计十二个新动作；仅新建自有文件。'
+                seed = goal['comparison']['seed']
+                lines += [f"复用 {len(seed['source_ids'])} 页历史捕获；来源记录：{seed['run']}",
+                          f"至少读取{goal['min_sources']}页，核验{goal['comparison']['min_domains']}个全维度有据的独立来源组。",
+                          '历史捕获可能已过时；旧结论不沿用，模型复核仍需人工确认。']
         else:
             lines[-1] += '旧版证据：仅逐字核验，未核验语义和来源独立性。'
     if 'recovery' in plan:
@@ -256,6 +262,8 @@ def _run_owned(session, plan, goal, run, *, github, stop, progress, clock,
         'lifecycle':{'version':1,'owner_sha256':digest(read_record(run/'owner.json'))}})
     until, completed, attempts = clock()+MAX_SECONDS, [], []
     if 'comparison' in goal:
+        from .publisher_evidence import review_instructions
+        attribution_instructions = review_instructions(goal)
         from .source_comparison import SYSTEM, MAX_TOKENS
         environment_options['comparison_select'] = lambda context: model_json(
             session, context, SYSTEM, client=client, stop=stop,
@@ -263,7 +271,7 @@ def _run_owned(session, plan, goal, run, *, github, stop, progress, clock,
         if goal['comparison'].get('evidence_version') in {2,3,4}:
             from .comparison_review import REVIEW_SYSTEM, REVIEW_MAX_TOKENS
             environment_options['comparison_review'] = lambda context: model_json(
-                session, context, REVIEW_SYSTEM, client=client, stop=stop,
+                session, context, REVIEW_SYSTEM + attribution_instructions, client=client, stop=stop,
                 deadline=until, clock=clock, max_tokens=REVIEW_MAX_TOKENS)
         if goal['comparison'].get('evidence_version') == 4:
             from .comparison_model_transport import call_model
@@ -273,7 +281,7 @@ def _run_owned(session, plan, goal, run, *, github, stop, progress, clock,
                 lambda wire: model_json(session, wire, SYSTEM_V4, client=client, stop=stop,
                     deadline=until, clock=clock, max_tokens=MAX_TOKENS))
             environment_options['comparison_review'] = lambda context: call_model(context,
-                lambda wire: model_json(session, wire, REVIEW_SYSTEM_V4, client=client, stop=stop,
+                lambda wire: model_json(session, wire, REVIEW_SYSTEM_V4 + attribution_instructions, client=client, stop=stop,
                     deadline=until, clock=clock, max_tokens=REVIEW_MAX_TOKENS))
     observation, uncertain = {}, False
     refreshes = []
@@ -364,9 +372,10 @@ def _run_owned(session, plan, goal, run, *, github, stop, progress, clock,
                     'when sources_ready; avoid extra search after enough qualifying sources. Prefer reading discovered '
                     'candidates before alternative searches. For a failed search choose an available alternative. '
                     'The local verifier decides source adequacy and completion independently.')
-                response = model_json(session, context, system,
+                from .action_choice_transport import call_model as choose_action
+                response = choose_action(context, lambda wire: model_json(session, wire, system,
                     client=client, stop=stop, deadline=until, clock=clock,
-                    max_tokens=80 if public_auto else 256)
+                    max_tokens=80 if public_auto else 256), allow_none=bool(public_auto))
                 if public_auto and response == {'action_id':None}:
                     raise ComputerError('public_site_no_relevant_result')
                 if type(response) is not dict or set(response) != {'action_id'} or type(response['action_id']) is not str:
@@ -432,6 +441,9 @@ def _run_owned(session, plan, goal, run, *, github, stop, progress, clock,
                    failures=observation.get('failures',[]))
     if dynamic_browser:
         outcome['reobservations'] = refreshes
+    if not outcome['ok'] and observation.get('comparison_assessment'):
+        outcome['comparison_assessment'] = deepcopy(observation['comparison_assessment'])
+        outcome['comparison_dimensions'] = deepcopy(observation.get('comparison_dimensions', []))
     if goal.get('kind') == 'interactive':
         outcome['goal_kind'] = 'interactive'
     if 'recovery' in plan:

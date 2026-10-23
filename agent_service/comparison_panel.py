@@ -21,7 +21,7 @@ def fields_from_goal(goal):
         'min_domains': str(goal['comparison']['min_domains'])}
 
 
-def open_editor(parent, on_save, initial=None):
+def open_editor(parent, on_save, initial=None, *, locked_queries=False):
     import tkinter as tk
     from tkinter import ttk
     top = tk.Toplevel(parent)
@@ -31,7 +31,8 @@ def open_editor(parent, on_save, initial=None):
     top.grab_set()
     body = ttk.Frame(top, padding=14)
     body.pack(fill='both', expand=True)
-    ttk.Label(body, text='批准后检索实际结果并读取来源，再按维度选取原文，生成 Excel 和 Word。',
+    ttk.Label(body, text=('复用已核验的历史捕获；检索主题固定，可修改维度，批准后重新复核并按需补查。'
+                         if locked_queries else '批准后检索实际结果并读取来源，再按维度选取原文，生成 Excel 和 Word。'),
               wraplength=690).pack(anchor='w')
     fields = {}
     entries = [('query1', '检索主题一（可使用 site: 限定网站）', ''),
@@ -49,6 +50,8 @@ def open_editor(parent, on_save, initial=None):
                                  values=('2', '3', '4') if key == 'min_sources' else ('1', '2'))
         else:
             widget = ttk.Entry(body, textvariable=variable)
+        if locked_queries and key in {'query1', 'query2'}:
+            widget.configure(state='readonly')
         widget.pack(fill='x')
     ttk.Label(body, text='缺证时自动补查和替换候选，最多两轮复核；每个独立来源组须覆盖全部维度后才交付。仍受现有预算和次数限制，模型判断需人工确认。',
               wraplength=690).pack(anchor='w', pady=10)

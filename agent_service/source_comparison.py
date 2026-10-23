@@ -47,15 +47,38 @@ def _plain(value, limit):
 
 def validate_comparison(value):
     fields = {'dimensions', 'min_domains'}
-    if (type(value) is not dict or set(value) not in (fields, fields | {'evidence_version'}, fields | {'evidence_version', 'seed'})
+    allowed = (fields, fields | {'evidence_version'}, fields | {'evidence_version', 'seed'},
+               fields | {'evidence_version', 'seed', 'completion_policy'})
+    if (type(value) is not dict or set(value) - {'publisher_policy', 'dimension_routing', 'capture_import'} not in allowed
             or 'evidence_version' in value and
             (type(value['evidence_version']) is not int or value['evidence_version'] not in {2,3,4})):
+        _fail('comparison_invalid')
+    if 'dimension_routing' in value and (type(value['dimension_routing']) is not int
+            or value['dimension_routing'] not in (2, 3, 4, 5, 6) or value.get('completion_policy') != 'dimension_first_v4'):
+        _fail('comparison_invalid')
+    if value.get('dimension_routing') in (5, 6) and (type(value.get('seed')) is not dict or value['seed'].get('version') != 5):
+        _fail('comparison_invalid')
+    if 'publisher_policy' in value:
+        from .publisher_evidence import POLICIES
+        if value.get('evidence_version') not in {3, 4} or value['publisher_policy'] not in POLICIES:
+            _fail('comparison_invalid')
+    if 'completion_policy' in value and (value.get('evidence_version') != 4
+            or type(value['completion_policy']) is not str
+            or value['completion_policy'] not in {'original_query_fallback_v1', 'capture_repair_v2', 'dimension_repair_v3', 'dimension_first_v4'}):
+        _fail('comparison_invalid')
+    if (value.get('completion_policy') in ('capture_repair_v2', 'dimension_repair_v3', 'dimension_first_v4')
+            and (type(value.get('seed')) is not dict or value['seed'].get('version') not in {4, 5})):
         _fail('comparison_invalid')
     if 'seed' in value:
         if value.get('evidence_version') != 4:
             _fail('comparison_invalid')
         from .comparison_seed import validate_manifest
         validate_manifest(value['seed'])
+    if 'capture_import' in value:
+        if value.get('dimension_routing') != 6 or 'seed' not in value:
+            _fail('comparison_invalid')
+        from .comparison_capture_import import validate_manifest as validate_import
+        validate_import(value['capture_import'], value['seed'])
     dimensions = value['dimensions']
     if (type(dimensions) is not list or not 1 <= len(dimensions) <= 3
             or any(not _plain(v, 60) for v in dimensions)
@@ -253,6 +276,22 @@ def review_failure(evidence):
 def introduction(goal):
     if goal['comparison'].get('evidence_version') not in {2,3,4}:
         return WORD_INTRO
+    from .publisher_scope import enabled as repository_policy
+    from .project_scope import enabled as project_policy
+    if project_policy(goal):
+        return ('本表经过原文选择与独立模型复核；发布方须有明确具名归属引句。'
+                'GitHub、GitLab、Codeberg及Hugging Face跨页支持仅限已解析的同一项目；'
+                'GitLab保留完整嵌套命名空间，Hugging Face区分模型、数据集与Space。'
+                '同账号其他项目、论文作者与许可证模板署名不直接证明本项目发布方。'
+                '已识别多租户平台边界不明时仅采用本页归属；普通网站仍限同精确主机。'
+                '同源页面保守合组，归属及全部维度有据且相互独立才计数；缺证自动有界补查。'
+                '历史不足与失败保留，链接不证明身份，模型复核不等于人工事实确认，不作排名。')
+    if repository_policy(goal):
+        return ('本表经过原文选择与独立模型复核；发布方或自述出版项目须有明确归属引句。'
+                'GitHub跨页归属支持仅限同一账号下的同一仓库；账号相同或同站其他项目均不能互借。'
+                '其他已识别的多租户平台若无法确定项目边界，只采用本页归属；普通网站仍限同精确主机。'
+                '同源页面合组，只有归属和全部指定维度均有据且相互独立的来源组计数。'
+                '缺证时有界补查，历史不足与失败保留；跨页导航不证明身份，模型复核不等于人工事实确认，不作排名。')
     if goal['comparison'].get('evidence_version') == 4:
         return ('本表基于已核验的历史捕获和有界跨站补证，逐字证据经过独立模型复核。'
                 '发布方或自述出版项目须有直接归属引句，或同精确主机支持页；跨站导航不构成身份依据。'
@@ -322,6 +361,22 @@ def _reviewed_table(context, evidence):
         if evidence['version'] in {3,4} and assessment['publisher_support'][source['id']] is not None:
             anchor = next(s for s in context['sources'] if s['id'] == assessment['publisher_support'][source['id']])
             support_note = '；发布方依据：' + anchor['url']
+            role = assessment.get('publisher_roles', {}).get(anchor['id'])
+            if role in {'project_author', 'project_maintainer'}:
+                label = {'project_author': '项目作者', 'project_maintainer': '项目维护者'}[role]
+                support_note = '；具名归属依据（' + label + '，不证明法律所有权）：' + anchor['url']
+            if assessment.get('publisher_support_reasons', {}).get(source['id']) == 'project_roles_coexist':
+                support_note += '；同项目多位作者/维护者并存，仍计一个来源组'
+        from .publisher_evidence import enabled, REASONS
+        if enabled(context['goal']) and assessment['publisher_support'][source['id']] is None:
+            reason = assessment['publisher_evidence'].get(source['id'])
+            from .publisher_scope import REASONS as scope_reasons
+            scope_reasons = {**scope_reasons, 'project_scope_missing': '无法确认项目边界，需本页归属依据'}
+            scoped = assessment.get('publisher_support_reasons', {}).get(source['id'])
+            if scoped in scope_reasons:
+                support_note += '：' + scope_reasons[scoped]
+            elif reason in REASONS:
+                support_note += '：' + REASONS[reason]
         rows.append([source['title'], f"组{groups[source['id']]} · {site_key(source['url'])}",
                      *cells, source['url'], source['captured_at'], counts +
                      support_note])

@@ -380,12 +380,39 @@ def _coverage(sheets):
             "numeric_precision": "15_significant_digits"}
 
 
+def _same_native_formula(actual, expected, sheet, bounds):
+    """Allow native sheet-name quoting normalization, not merely equal results."""
+    if actual == expected:
+        return True
+    def identity(expression):
+        parser = _Parser(expression, sheet, bounds)
+        parser.parse()  # Both sides must still obey the bounded formula grammar.
+        result = []
+        for token in parser.tokens:
+            value = token.value
+            if token.type == "OPERAND" and token.subtype == "RANGE":
+                match = _REF.fullmatch(value)
+                quoted, plain, first, last = match.groups()
+                name = quoted.replace("''", "'") if quoted is not None else plain
+                # Preserve relative/absolute anchors and local-vs-qualified form.
+                value = (name.casefold() if name is not None else None,
+                         first.upper(), last.upper() if last is not None else None)
+            result.append((token.type, token.subtype, value))
+        return result
+    try:
+        return identity(actual) == identity(expected)
+    except (WorkbookSourceError, ValueError, TypeError, AttributeError):
+        return False
+
+
 def _native_matches(receipt, observed, digest):
     if (type(receipt) is not dict or type(receipt.get("version")) is not int or receipt.get("version") != 1 or receipt.get("source_sha256") != digest
             or receipt.get("application_verified") is not True or receipt.get("file_unchanged") is not True
             or type(receipt.get("app")) is not dict or receipt["app"].get("progid") != "KET.Application"
             or type(receipt.get("sheets")) is not list or len(receipt["sheets"]) != len(observed["sheets"])):
         _fail("workbook_native_receipt_invalid")
+    bounds = {sheet["name"]: (len(sheet["values"]), len(sheet["values"][0]))
+              for sheet in observed["sheets"]}
     for actual, expected in zip(receipt["sheets"], observed["sheets"]):
         if type(actual) is not dict or any(actual.get(key) != expected[key] for key in ("name", "range", "state")):
             _fail("workbook_native_mismatch")
@@ -400,7 +427,8 @@ def _native_matches(receipt, observed, digest):
         if type(formulas) is not list or len(formulas) != len(expected["formulas"]):
             _fail("workbook_native_mismatch")
         for formula, wanted in zip(formulas, expected["formulas"]):
-            if (type(formula) is not dict or formula.get("cell") != wanted["cell"] or formula.get("expression") != wanted["expression"]
+            if (type(formula) is not dict or formula.get("cell") != wanted["cell"]
+                    or not _same_native_formula(formula.get("expression"), wanted["expression"], expected["name"], bounds)
                     or not _equal_scalar(formula.get("result"), wanted["result"])):
                 _fail("workbook_native_mismatch")
 
@@ -485,6 +513,11 @@ def snapshot_workbook_source(path, task_root, stop=lambda: False, deadline=None)
 def verify_workbook_source(task_root):
     directory = Path(task_root) / "sources"
     public = validate_snapshot(_read(directory / "source.json"))
+    request_path = directory / "native-request.json"
+    if request_path.exists() or office_source._linked(request_path):
+        request = _read(request_path)
+        if type(request) is not dict or request != {"sha256": public["sha256"]}:
+            _fail("workbook_native_request_changed")
     if (_digest(directory / "source.xlsx") != public["sha256"]
             or (directory / "source.xlsx").stat().st_size != public["bytes"]
             or _digest(directory / "source-native.json") != public["native_sha256"]):

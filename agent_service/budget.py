@@ -53,6 +53,14 @@ class BudgetLedger:
                     OR (settled_at IS NOT NULL AND settled_day IS NOT NULL
                         AND charge_micro IS NOT NULL AND usage_json IS NOT NULL))
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS budget_faults (
+                reservation_id TEXT PRIMARY KEY REFERENCES reservations(id),
+                fault_code TEXT NOT NULL CHECK
+                    (fault_code IN ('reservation_overrun', 'request_bound_exceeded')),
+                reserved_micro INTEGER NOT NULL CHECK (reserved_micro > 0),
+                charge_micro INTEGER NOT NULL CHECK (charge_micro >= 0),
+                detected_at REAL NOT NULL
+            )""")
 
     @contextmanager
     def _transaction(self, *, write=True):
@@ -91,6 +99,8 @@ class BudgetLedger:
         if not isinstance(request_hash, str) or not request_hash.strip():
             raise BudgetError("request_hash must be a nonempty string")
         with self._transaction() as db:
+            if db.execute("SELECT 1 FROM budget_faults LIMIT 1").fetchone():
+                raise BudgetError("model budget accounting fault")
             now, day = self._now()
             held, daily, rolling = self._totals(db, now, day)
             if (amount_micro > self.limit_micro - held - daily
@@ -131,14 +141,61 @@ class BudgetLedger:
                 charge_micro = ?, usage_json = ? WHERE id = ? AND charge_micro IS NULL""",
                 (now, day, charge_micro, usage_json, reservation_id))
 
+    def settle_anomaly(self, reservation_id: str, charge_micro: int, usage: dict, *, reason: str) -> None:
+        """Record trustworthy usage outside request bounds and stop new calls.
+
+        This records spending that already happened; it never authorizes extra
+        spending. Ordinary settlement keeps its original reservation ceiling.
+        """
+        if reason not in ("reservation_overrun", "request_bound_exceeded"):
+            raise BudgetError("unknown budget anomaly reason")
+        if not isinstance(reservation_id, str) or not reservation_id:
+            raise BudgetError("reservation_id must be a nonempty string")
+        if type(charge_micro) is not int or charge_micro < 0:
+            raise BudgetError("charge_micro must be a nonnegative integer")
+        if type(usage) is not dict:
+            raise BudgetError("usage must be a JSON-serializable dict")
+        try:
+            usage_json = json.dumps(usage, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise BudgetError("usage must be a JSON-serializable dict") from exc
+        with self._transaction() as db:
+            row = db.execute("""SELECT reserved_micro, charge_micro, usage_json
+                FROM reservations WHERE id = ?""", (reservation_id,)).fetchone()
+            if row is None:
+                raise BudgetError("unknown reservation")
+            reserved, prior_charge, prior_usage = row
+            if reason == "reservation_overrun" and charge_micro <= reserved:
+                raise BudgetError("overrun charge must exceed reserved amount")
+            if prior_charge is not None:
+                prior_fault = db.execute("SELECT fault_code FROM budget_faults WHERE reservation_id = ?",
+                                         (reservation_id,)).fetchone()
+                if (charge_micro == prior_charge and usage_json == prior_usage
+                        and prior_fault == (reason,)):
+                    return
+                raise BudgetError("reservation already settled with different values")
+            now, day = self._now()
+            db.execute("""UPDATE reservations SET settled_at = ?, settled_day = ?,
+                charge_micro = ?, usage_json = ? WHERE id = ? AND charge_micro IS NULL""",
+                (now, day, charge_micro, usage_json, reservation_id))
+            db.execute("""INSERT INTO budget_faults
+                (reservation_id, fault_code, reserved_micro, charge_micro, detected_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (reservation_id, reason, reserved, charge_micro, now))
+
+    def settle_overrun(self, reservation_id: str, charge_micro: int, usage: dict) -> None:
+        """Record a charge above its reservation without authorizing new spend."""
+        self.settle_anomaly(reservation_id, charge_micro, usage, reason="reservation_overrun")
+
     def snapshot(self) -> dict:
         with self._transaction(write=False) as db:
             now, day = self._now()
             held, daily, rolling = self._totals(db, now, day)
+            faulted = db.execute("SELECT 1 FROM budget_faults LIMIT 1").fetchone() is not None
             return {
                 "limit_micro": self.limit_micro,
                 "charged_micro": daily,
                 "held_micro": held,
-                "remaining_micro": max(0, min(self.limit_micro - held - daily,
-                                                self.limit_micro - held - rolling)),
+                "remaining_micro": 0 if faulted else max(0, min(self.limit_micro - held - daily,
+                                                               self.limit_micro - held - rolling)),
             }

@@ -23,6 +23,7 @@ R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _CELL = re.compile(r"[A-Z]{1,2}[1-9][0-9]{0,3}\Z")
 _WORD_COORDINATES = ("table_index", "row_index", "column_index", "paragraph_index")
+_XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
 
 class EditError(ValueError):
@@ -86,6 +87,57 @@ def _word_target(paragraph):
     if any(child.tag not in {f"{{{W}}}pPr", f"{{{W}}}r"} for child in paragraph):
         return None
     return texts[0]
+
+
+def _word_text_nodes(paragraph):
+    """Return plain direct text nodes; non-text run content remains read-only."""
+    if any(child.tag not in {f"{{{W}}}pPr", f"{{{W}}}r"} for child in paragraph):
+        return None
+    nodes = []
+    for run in paragraph.findall(f"{{{W}}}r"):
+        if any(child.tag not in {f"{{{W}}}rPr", f"{{{W}}}t"} for child in run):
+            return None
+        nodes.extend(run.findall(f"{{{W}}}t"))
+    return nodes or None
+
+
+def _word_edit_target(paragraph, before, after):
+    """Resolve an unambiguous whole-paragraph edit to exactly one w:t node."""
+    nodes = _word_text_nodes(paragraph)
+    if nodes is None or "".join(node.text or "" for node in nodes) != before:
+        raise EditError("edit_word_complex")
+
+    def candidates(values, old, new):
+        found = []
+        prefix = ""
+        for index, value in enumerate(values):
+            suffix = old[len(prefix) + len(value):]
+            if (new.startswith(prefix) and new.endswith(suffix)
+                    and len(new) >= len(prefix) + len(suffix)):
+                replacement = new[len(prefix):len(new) - len(suffix) if suffix else len(new)]
+                if replacement != value:
+                    found.append((index, replacement))
+            prefix += value
+        return found
+
+    values = [node.text or "" for node in nodes]
+    forward = candidates(values, before, after)
+    if len(forward) != 1:
+        raise EditError("edit_word_ambiguous" if forward else "edit_word_complex")
+    index, replacement = forward[0]
+    changed = list(values)
+    changed[index] = replacement
+    reverse = candidates(changed, after, before)
+    if len(reverse) != 1 or reverse[0][0] != index:
+        raise EditError("edit_word_ambiguous")
+    return nodes[index], replacement
+
+
+def _word_output_space(node, replacement, observation_version):
+    if observation_version == 1:
+        return "preserve"  # Historical single-node writer always set this.
+    return ("preserve" if replacement[:1].isspace() or replacement[-1:].isspace()
+            else node.get(_XML_SPACE))
 
 
 def _word_body(parts):
@@ -214,7 +266,62 @@ def _word_paragraph(tree, change):
         raise EditError("edit_word_target_missing") from exc
 
 
-def _observe(path, kind):
+def _formula_expectations(observed):
+    """Evaluate bounded formula dependencies without trusting stored OOXML caches."""
+    from openpyxl.utils.cell import coordinate_to_tuple
+    from . import workbook_source
+
+    bounds, literals, formulas = {}, {}, {}
+    for sheet in observed["sheets"]:
+        rows = columns = 0
+        for cell in sheet["cells"]:
+            row, column = coordinate_to_tuple(cell["cell"])
+            rows, columns = max(rows, row), max(columns, column)
+            key = sheet["name"], cell["cell"]
+            value = cell["value"]
+            if type(value) is dict:
+                formulas[key] = value["formula"]
+            else:
+                literals[key] = value
+        bounds[sheet["name"]] = rows, columns
+    if not formulas:
+        return {}, []
+    if len(formulas) > workbook_source.MAX_FORMULAS:
+        raise EditError("edit_formula_limit")
+    try:
+        references = set()
+        def visit(node):
+            if node[0] == "reference":
+                references.update(node[1])
+            elif node[0] == "sum":
+                for child in node[1]:
+                    visit(child)
+            elif node[0] == "unary":
+                visit(node[2])
+            elif node[0] == "binary":
+                visit(node[2])
+                visit(node[3])
+        for key, expression in formulas.items():
+            visit(workbook_source._Parser(expression, key[0], bounds).parse())
+            if len(references | formulas.keys()) > workbook_source.MAX_CELLS:
+                raise EditError("edit_formula_limit")
+        for key in references:
+            if key not in formulas:
+                literals.setdefault(key, None)
+        evaluator = workbook_source._Evaluator(literals, formulas, bounds)
+        for key in formulas:
+            evaluator.cell(key)
+        return {key: evaluator.values[key] for key in formulas}, evaluator.order
+    except EditError:
+        raise
+    except (workbook_source.WorkbookSourceError, ValueError) as exc:
+        raise EditError("edit_formula_unsupported") from exc
+
+
+def _observe(path, kind, observation_version=1):
+    if (type(observation_version) is not int or observation_version not in (1, 2)
+            or (kind != "document" and observation_version != 1)):
+        raise EditError("edit_observation_version_invalid")
     parts = _parts(path)
     if kind == "document":
         body = _word_body(parts)
@@ -222,8 +329,10 @@ def _observe(path, kind):
         tables = _word_layout(body)
         if len(paragraphs) > 100 or len(tables) > 8 or not (paragraphs or tables):
             raise EditError("edit_word_limit")
+        editable = (lambda p: _word_text_nodes(p) is not None) if observation_version == 2 else (
+            lambda p: _word_target(p) is not None)
         observed = {"paragraphs": [{"index": i, "text": office_source._word_text(p),
-                                    "editable": _word_target(p) is not None}
+                                    "editable": editable(p)}
                                    for i, p in enumerate(paragraphs)]}
         if tables:
             cells = []
@@ -238,7 +347,7 @@ def _observe(path, kind):
                             cells.append(dict(zip(_WORD_COORDINATES, (table_index, row_index, column_index,
                                                                       paragraph_index)),
                                               text=office_source._word_text(paragraph),
-                                              editable=_word_target(paragraph) is not None))
+                                              editable=editable(paragraph)))
                             if len(cells) > 1000:
                                 raise EditError("edit_observation_limit")
             observed["table_cells"] = cells
@@ -263,13 +372,7 @@ def _observe(path, kind):
                 coordinate = node.get("r")
                 cell = sheet[coordinate]
                 if cell.data_type == "f":
-                    # Existing bounded local arithmetic/SUM formulas only. Never
-                    # execute network functions, external books or DDE on opening.
-                    formula = cell.value
-                    if not re.fullmatch(r"=[A-Za-z0-9_ :.$,+*/()\-]+", formula) or any(
-                            fn.upper() != "SUM" for fn in re.findall(r"([A-Za-z_]+)\s*\(", formula)):
-                        raise EditError("edit_formula_unsupported")
-                    value = {"formula": formula}
+                    value = {"formula": cell.value}
                 else:
                     try:
                         value = _scalar(cell.value)
@@ -285,6 +388,11 @@ def _observe(path, kind):
     finally:
         book.close()
     observed = {"sheets": output}
+    if any(type(cell["value"]) is dict for sheet in output for cell in sheet["cells"]):
+        workbook = _xml(parts["xl/workbook.xml"])
+        if workbook.findall(f"{{{S}}}definedNames/{{{S}}}definedName"):
+            raise EditError("edit_formula_unsupported")
+        _formula_expectations(observed)
     if len(json.dumps(observed, ensure_ascii=False)) > 64_000:
         raise EditError("edit_observation_limit")
     return observed
@@ -300,8 +408,12 @@ def snapshot_edit_source(path, root):
     snapshot = root / ("source" + suffix)
     digest, size = office_source._copy_stable(source, snapshot)
     kind = "document" if suffix == ".docx" else "spreadsheet"
+    observation_version = 2 if kind == "document" else 1
     result = {"source_id": "selected-edit", "kind": kind, "sha256": digest,
-              "bytes": size, "display_name": source.name, "observed": _observe(snapshot, kind)}
+              "bytes": size, "display_name": source.name,
+              "observed": _observe(snapshot, kind, observation_version)}
+    if kind == "document":
+        result["observation_version"] = observation_version
     _write(root / "source.json", {"public": result, "original": str(source)})
     return result
 
@@ -312,8 +424,12 @@ def verify_edit_source(source_root):
     public = record["public"]
     suffix = ".docx" if public["kind"] == "document" else ".xlsx"
     path = root / ("source" + suffix)
+    observation_version = public.get("observation_version", 1)
+    if (type(observation_version) is not int or observation_version not in (1, 2)
+            or (public["kind"] != "document" and observation_version != 1)):
+        raise EditError("edit_source_changed")
     if (_hash(path) != public["sha256"] or _hash(record["original"]) != public["sha256"]
-            or _observe(path, public["kind"]) != public["observed"]):
+            or _observe(path, public["kind"], observation_version) != public["observed"]):
         raise EditError("edit_source_changed")
     return deepcopy(public)
 
@@ -363,6 +479,8 @@ def _bind(spec, source_root):
     source = verify_edit_source(source_root)
     if source["kind"] != spec["kind"] or source["sha256"] != spec["source_sha256"]:
         raise EditError("edit_source_mismatch")
+    tree = (_xml(_parts(Path(source_root) / "source.docx")["word/document.xml"])
+            if spec["kind"] == "document" and source.get("observation_version") == 2 else None)
     for change in spec["changes"]:
         if spec["kind"] == "document":
             item = _word_observed_item(source["observed"], change)
@@ -373,10 +491,12 @@ def _bind(spec, source_root):
             value = item["value"] if item else None
         if item is None or item["editable"] is not True or not _equal_scalar(value, change["before"]):
             raise EditError("edit_before_mismatch")
+        if tree is not None:
+            _word_edit_target(_word_paragraph(tree, change), change["before"], change["after"])
     return spec, source
 
 
-def _masked(parts, spec):
+def _masked(parts, spec, word_indices=None):
     result = dict(parts)
     grouped = {}
     if spec["kind"] == "document":
@@ -387,13 +507,20 @@ def _masked(parts, spec):
             grouped.setdefault(sheets[change["sheet"]], []).append(change)
     for part, changes in grouped.items():
         tree = _xml(parts[part])
-        for change in changes:
+        for position, change in enumerate(changes):
             if spec["kind"] == "document":
-                node = _word_target(_word_paragraph(tree, change))
-                if node is None:
-                    raise EditError("edit_word_complex")
+                paragraph = _word_paragraph(tree, change)
+                if word_indices is None:
+                    current = office_source._word_text(paragraph)
+                    other = change["after"] if current == change["before"] else change["before"]
+                    node, _ = _word_edit_target(paragraph, current, other)
+                else:
+                    nodes = _word_text_nodes(paragraph)
+                    if nodes is None or word_indices[position] >= len(nodes):
+                        raise EditError("edit_preservation_mismatch")
+                    node = nodes[word_indices[position]]
                 node.text = "__EDIT_VALUE__"
-                node.attrib.pop("{http://www.w3.org/XML/1998/namespace}space", None)
+                node.attrib.pop(_XML_SPACE, None)
             else:
                 matches = tree.findall(f".//{{{S}}}c[@r='{change['cell']}']")
                 if len(matches) != 1:
@@ -409,18 +536,33 @@ def _masked(parts, spec):
     return result
 
 
-def verify_preservation(source_path, artifact, spec):
+def verify_preservation(source_path, artifact, spec, observation_version=1):
     """Independent check of every ZIP member and every unapproved XML node."""
     spec = validate_edit_spec(spec)
     before, after = _parts(source_path), _parts(artifact)
-    if _masked(before, spec) != _masked(after, spec):
-        raise EditError("edit_preservation_mismatch")
+    word_indices = None
     if spec["kind"] == "document":
-        original_tree = _xml(before["word/document.xml"])
-        if any(office_source._word_text(_word_paragraph(original_tree, change)) != change["before"]
-               for change in spec["changes"]):
-            raise EditError("edit_before_mismatch")
-    observed = _observe(artifact, spec["kind"])
+        source_tree = _xml(before["word/document.xml"])
+        output_tree = _xml(after["word/document.xml"])
+        word_indices = []
+        for change in spec["changes"]:
+            source_paragraph = _word_paragraph(source_tree, change)
+            if office_source._word_text(source_paragraph) != change["before"]:
+                raise EditError("edit_before_mismatch")
+            output_paragraph = _word_paragraph(output_tree, change)
+            node, replacement = _word_edit_target(source_paragraph, change["before"], change["after"])
+            index = _word_text_nodes(source_paragraph).index(node)
+            output_nodes = _word_text_nodes(output_paragraph)
+            if (output_nodes is None or index >= len(output_nodes)
+                    or (output_nodes[index].text or "") != replacement
+                    or office_source._word_text(output_paragraph) != change["after"]
+                    or output_nodes[index].get(_XML_SPACE) !=
+                    _word_output_space(node, replacement, observation_version)):
+                raise EditError("edit_preservation_mismatch")
+            word_indices.append(index)
+    if _masked(before, spec, word_indices) != _masked(after, spec, word_indices):
+        raise EditError("edit_preservation_mismatch")
+    observed = _observe(artifact, spec["kind"], observation_version)
     for change in spec["changes"]:
         if spec["kind"] == "document":
             item = _word_observed_item(observed, change)
@@ -435,17 +577,20 @@ def verify_preservation(source_path, artifact, spec):
     return observed
 
 
-def _make_copy(spec, source, target):
+def _make_copy(spec, source, target, observation_version=1):
     parts = _parts(source)
     modified = {}
     if spec["kind"] == "document":
         tree = _xml(parts["word/document.xml"])
         for change in spec["changes"]:
-            node = _word_target(_word_paragraph(tree, change))
-            if node is None:
-                raise EditError("edit_word_complex")
-            node.text = change["after"]
-            node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            node, replacement = _word_edit_target(_word_paragraph(tree, change),
+                                                  change["before"], change["after"])
+            space = _word_output_space(node, replacement, observation_version)
+            node.text = replacement
+            if space is None:
+                node.attrib.pop(_XML_SPACE, None)
+            else:
+                node.set(_XML_SPACE, space)
         modified["word/document.xml"] = ET.tostring(tree, encoding="UTF-8", xml_declaration=True)
     else:
         import openpyxl
@@ -551,6 +696,7 @@ def _native_readback(path, spec, observed, check):
     import pythoncom
     import win32com.client
     pythoncom.CoInitialize()
+    owned = None
     try:
         check()
         progid = "KWPS.Application" if spec["kind"] == "document" else "KET.Application"
@@ -572,19 +718,53 @@ def _native_readback(path, spec, observed, check):
             values = [{**{key: c[key] for key in (_WORD_COORDINATES if "table_index" in c else ("paragraph_index",))},
                        "after": c["after"]} for c in spec["changes"]]
         else:
+            from . import workbook_source
+            expected_results, order = _formula_expectations(observed)
+            if int(owned.Worksheets.Count) != len(observed["sheets"]):
+                raise EditError("edit_application_mismatch")
+            for name, coordinate in order:
+                check()
+                owned.Worksheets.Item(name).Range(coordinate).Calculate()
+            formula_results = []
+            bounds = {}
+            from openpyxl.utils.cell import coordinate_to_tuple
+            for sheet in observed["sheets"]:
+                rows = columns = 0
+                for cell in sheet["cells"]:
+                    row, column = coordinate_to_tuple(cell["cell"])
+                    rows, columns = max(rows, row), max(columns, column)
+                bounds[sheet["name"]] = rows, columns
             for sheet in observed["sheets"]:
                 native = owned.Worksheets.Item(sheet["name"])
                 for cell in sheet["cells"]:
                     check()
                     actual = native.Range(cell["cell"])
                     expected = cell["value"]
-                    value = actual.Formula if type(expected) is dict else actual.Value2
-                    if not _equal_scalar(value, expected["formula"] if type(expected) is dict else expected):
+                    if type(expected) is dict:
+                        key = sheet["name"], cell["cell"]
+                        value = actual.Value2
+                        if (not workbook_source._same_native_formula(str(actual.Formula), expected["formula"],
+                                                                     sheet["name"], bounds)
+                                or not _equal_scalar(value, expected_results[key])):
+                            raise EditError("edit_application_mismatch")
+                        formula_results.append({"sheet": key[0], "cell": key[1],
+                                                "expected_result": expected_results[key],
+                                                "native_result": value})
+                    elif not _equal_scalar(actual.Value2, expected):
                         raise EditError("edit_application_mismatch")
             values = [{"sheet": c["sheet"], "cell": c["cell"], "after": c["after"]} for c in spec["changes"]]
-        return {"progid": progid, "name": str(app.Name), "version": str(app.Version), "changes": values}
+        result = {"progid": progid, "name": str(app.Name), "version": str(app.Version), "changes": values}
+        if spec["kind"] == "spreadsheet" and formula_results:
+            result.update(formula_results=formula_results,
+                          calculation="owned_formula_ranges_in_dependency_order",
+                          stored_formula_caches="unchanged_in_output_package")
+        return result
     finally:
-        pythoncom.CoUninitialize()
+        try:
+            if owned is not None:
+                owned.Close(False)
+        finally:
+            pythoncom.CoUninitialize()
 
 
 def _native_simple_word(owned, observed, check):
@@ -646,9 +826,9 @@ def execute_edit(spec, root, source_root, stop=lambda: False):
         check()
         stage = "copy_edit"
         mark(stage)
-        _make_copy(spec, original, artifact)
+        _make_copy(spec, original, artifact, source.get("observation_version", 1))
         check()
-        observed = verify_preservation(original, artifact, spec)
+        observed = verify_preservation(original, artifact, spec, source.get("observation_version", 1))
         result.update(artifact=str(artifact), path=str(artifact), sha256=_hash(artifact),
                       source_sha256=source["sha256"], file_verified=True, preservation_verified=True)
         stage = "native_readback"
@@ -658,7 +838,7 @@ def execute_edit(spec, root, source_root, stop=lambda: False):
         # Once all native values were read successfully, later cancellation
         # cannot erase that evidence. Finish the read-only file/source checks.
         verify_edit_source(source_root)
-        verify_preservation(original, artifact, spec)
+        verify_preservation(original, artifact, spec, source.get("observation_version", 1))
         result.update(ok=True, state="succeeded", application_verified=True, original_unchanged=True,
                       app=app, observed=observed)
         receipt = {"spec": spec, "source_sha256": source["sha256"], "artifact": str(artifact),
@@ -691,7 +871,8 @@ def verify_edit_result(result, source_root, spec):
             or result["source_sha256"] != source["sha256"]):
         raise EditError("edit_receipt_mismatch")
     suffix = ".docx" if spec["kind"] == "document" else ".xlsx"
-    observed = verify_preservation(Path(source_root) / ("source" + suffix), artifact, spec)
+    observed = verify_preservation(Path(source_root) / ("source" + suffix), artifact, spec,
+                                   source.get("observation_version", 1))
     if observed != result["observed"]:
         raise EditError("edit_result_changed")
     return deepcopy(result)

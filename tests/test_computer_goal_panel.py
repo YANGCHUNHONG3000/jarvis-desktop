@@ -33,6 +33,19 @@ def test_idle_no_session_or_api(panel):
     assert p.plan is None and '先读取' in p.status.get()
 
 
+def test_unowned_office_recovery_opens_explicit_adoption_without_dispatch(panel, monkeypatch):
+    from agent_service import office_edit_adapter
+    p, _ = panel
+    p.plan = {'mode':'agent','goal':{'kind':'interactive','browser':None,'edits':[{}]},'recovery':{}}
+    original = p.plan
+    opened = []
+    monkeypatch.setattr(office_edit_adapter, 'owns_recovery', lambda *a: None)
+    monkeypatch.setattr(p, 'open_edit_adapter', lambda: opened.append(True))
+    monkeypatch.setattr(p, 'start', lambda *a: pytest.fail('unowned recovery must not dispatch'))
+    p.execute()
+    assert opened == [True] and p.plan is original
+
+
 def test_busy_blocks_execution(panel):
     p, changes = panel
     p.external_busy = lambda: True

@@ -27,24 +27,70 @@ class CompletionEnvironment(AgentEnvironment):
                    for sid in facts['need_reads'].get(need['need_id'], []))
 
     def _matches_need(self, item, need):
+        if need.get('purpose') in {'project_attribution', 'dynamic_project_attribution'}:
+            from .project_scope import same_project
+            return same_project(need['scope_url'], item['url'])
+        if need.get('purpose') == 'repository_attribution':
+            from .publisher_scope import same_repository
+            return same_repository(need['scope_url'], item['url'])
         return _host(item['url']) == need['host']
 
     def _discover_links(self, source, action, excluded):
+        if action.get('purpose') in {'repository_attribution', 'project_attribution', 'dynamic_project_attribution'}:
+            from .comparison_crosssite_discovery import CrossSiteDiscoveryProcess
+            try:
+                return CrossSiteDiscoveryProcess().discover(source, action['link_query'], excluded,
+                    should_stop=lambda: self.stop() or self.clock() >= self.deadline,
+                    timeout=min(35, self.deadline-self.clock()), purpose=action['purpose'])
+            except ComputerError as exc:
+                mapped = {'supplement_crosssite_timeout': 'supplement_links_timeout',
+                          'supplement_crosssite_unavailable': 'supplement_links_unavailable'}.get(str(exc))
+                if mapped:
+                    raise ComputerError(mapped) from None
+                raise
         from .comparison_link_discovery import LinkDiscoveryProcess
         return LinkDiscoveryProcess().discover(source, action['link_query'], excluded,
             should_stop=lambda: self.stop() or self.clock() >= self.deadline,
             timeout=min(20, self.deadline-self.clock()))
 
     def _validate_links(self, linked, source, action, excluded):
+        if action.get('purpose') in {'repository_attribution', 'project_attribution', 'dynamic_project_attribution'}:
+            from .comparison_crosssite_discovery import validate_crosssite_result
+            return validate_crosssite_result(linked, source, action['link_query'], excluded,
+                                             purpose=action['purpose'])
         from .comparison_link_discovery import validate_link_result
         return validate_link_result(linked, source, action['link_query'], excluded)
 
     def _supplement_allowed(self, record, action, urls):
+        if action.get('purpose') in {'project_attribution', 'dynamic_project_attribution'}:
+            from .project_scope import same_project
+            return all(same_project(action['scope_url'], url) for url in urls)
+        if action.get('purpose') == 'repository_attribution':
+            from .publisher_scope import same_repository
+            return all(same_repository(action['scope_url'], url) for url in urls)
         return all(_host(url) == action['host'] for url in urls)
 
     def _reader(self, query):
+        from .project_documents import enabled as dynamic_policy
+        if dynamic_policy(self.goal):
+            from .project_reader import ProjectReaderProcess
+            return self.browser or ProjectReaderProcess(query, include_attribution=False)
         from .browser import BrowserProcess
         return self.browser or BrowserProcess(query=query)
+
+    def _validate_project_document(self, record, url, query):
+        from .project_documents import enabled as dynamic_policy
+        from .project_scope import project_scope
+        if not dynamic_policy(self.goal) or project_scope(url) is None:
+            return
+        from .project_reader import validate_read
+        try:
+            value = validate_read({'observation': {k:v for k,v in record['observation'].items() if k!='sha256'},
+                                   'document_proof': record.get('document_proof')}, url, query)
+            if value.to_dict() != record['observation']:
+                raise ValueError()
+        except (BrowserReadError, ValueError, KeyError):
+            raise ComputerError('agent_evidence_changed') from None
 
     def _empty(self):
         return dict(records=[], queries=[], candidates=[], reads={}, failures=[], artifacts=[],
@@ -73,18 +119,45 @@ class CompletionEnvironment(AgentEnvironment):
             support = assessment.get('publisher_support', {})
             sid = next((sid for sid in group['ids'] if not support.get(sid)), group['ids'][0])
             host = _host(by_id[sid]['url'])
-            if any(need['host'] == host for need in needs):
-                continue
             covered = group['covered_dimensions']
             missing = [d for i, d in enumerate(dimensions) if not covered[i]]
             suffix = ('about company' if not group['publisher_supported']
                       else ' '.join(missing) if missing else 'copyright publisher')
+            from .publisher_scope import enabled as scoped, repository_scope
+            repo = repository_scope(by_id[sid]['url']) if scoped(self.goal) and not group['publisher_supported'] else None
+            if scoped(self.goal) and not group['publisher_supported'] and host == 'github.com' and repo is None:
+                continue
+            scope_host = f'github.com/{repo[1]}/{repo[2]}' if repo else host
+            if any((need.get('scope_url') == f'https://{scope_host}' if repo else
+                    need['host'] == host and 'scope_url' not in need) for need in needs):
+                continue
+            if repo:
+                suffix = 'authors maintainers copyright publisher'
             approved = self.goal['queries'][by_id[sid]['query_index']]
             topic = re.sub(r'\bsite:\S+', '', approved, flags=re.IGNORECASE).strip()[:80]
-            fixed = f'site:{host} {suffix}'
-            query = f'site:{host} {topic[:max(0, 499 - len(fixed))]} {suffix}'
+            fixed = f'site:{scope_host} {suffix}'
+            query = f'site:{scope_host} {topic[:max(0, 499 - len(fixed))]} {suffix}'
             need = {'host': host, 'query': query, 'link_query': fixed,
                     'review_sha256': digest(evidence)}
+            if repo:
+                need.update(purpose='repository_attribution', scope_url=f'https://{scope_host}',
+                            source_id=sid, capture_sha256=digest(facts['reads'][sid]['observation']))
+            from .project_scope import enabled as project_policy, project_site, requires_project, same_project
+            if project_policy(self.goal) and not group['publisher_supported']:
+                source = by_id[sid]['url']
+                site = project_site(source)
+                if requires_project(source) and site is None:
+                    continue
+                if site:
+                    if any(same_project(n.get('scope_url'), source) for n in needs):
+                        continue
+                    query = f'site:{site} authors maintainers copyright publisher'
+                    if len(query) > 500:
+                        continue  # Never truncate a project boundary into a broader query.
+                    from .project_documents import enabled as dynamic_policy
+                    need.update(purpose='dynamic_project_attribution' if dynamic_policy(self.goal) else 'project_attribution', scope_url=source, source_id=sid,
+                                capture_sha256=digest(facts['reads'][sid]['observation']),
+                                query=query, link_query=query)
             need['need_id'] = digest(need)[:24]
             needs.append(need)
             if len(needs) == 2:
@@ -95,13 +168,19 @@ class CompletionEnvironment(AgentEnvironment):
         return any(hint in urlsplit(item['url']).path.casefold() for hint in HINTS)
 
     def _link_inputs(self, facts, action):
+        if action.get('purpose') in {'repository_attribution', 'project_attribution', 'dynamic_project_attribution'}:
+            item = next((item for item in facts['candidates'] if item['id'] == action['source_id']), None)
+            if item is None or digest(facts['reads'][item['id']]['observation']) != action['capture_sha256']:
+                raise ComputerError('comparison_seed_capture_changed')
+            return item['url'], [i['url'] for i in facts['candidates'] if i['id'] in facts['reads']]
         source = next(item['url'] for item, _ in self._accepted_active(facts)
                       if _host(item['url']) == action['host'])
         excluded = [item['url'] for item in facts['candidates'] if item['id'] in facts['reads']]
         return source, excluded
 
     def _retain(self, facts, response):
-        if not facts['comparisons']:
+        from .comparison_repair import enabled
+        if not facts['comparisons'] or (enabled(self.goal) and 'comparison' not in facts['comparisons'][0]):
             return {'response': deepcopy(response), 'retained': []}
         from .comparison_retention import retain_selection
         first = facts['comparisons'][0]
@@ -120,6 +199,9 @@ class CompletionEnvironment(AgentEnvironment):
             return []
         if facts['office_started']:
             return []
+        from .comparison_repair import enabled, format_retry
+        if enabled(self.goal) and format_retry(facts):
+            return ([{'kind': 'compare'}] if 12-len(facts['records']) >= 1+len(self.goal['outputs']) else [])
         if facts['comparisons']:
             if len(facts['comparisons']) >= 2:
                 return []
@@ -133,7 +215,8 @@ class CompletionEnvironment(AgentEnvironment):
                 searched = need['need_id'] in facts['supplements']
                 unread = [item for item in facts['candidates']
                           if item['id'] not in facts['reads'] and self._matches_need(item, need)
-                          and (self._hinted(item) or item.get('need_id') == need['need_id'])]
+                          and (self._hinted(item) or item.get('need_id') == need['need_id']
+                               or enabled(self.goal) and 'prior_need_key' in item)]
                 if unread:
                     if remaining < finish + 1:
                         break
@@ -203,6 +286,7 @@ class CompletionEnvironment(AgentEnvironment):
 
     def _replay(self, records, *, verify_office=True):
         from .source_comparison import verify_evidence, review_failure
+        from .comparison_repair import enabled as enabled_repair, format_retry as retry_format
         facts = self._empty()
         for position, (record, record_hash) in enumerate(records):
             action, result = record['action'], record['result']
@@ -217,8 +301,13 @@ class CompletionEnvironment(AgentEnvironment):
                     facts['queries'].append(index)
                 else:
                     facts['supplements'].append(action['need_id'])
-                    index = next(item['query_index'] for item in facts['candidates']
-                                 if _host(item['url']) == action['host'])
+                    if action.get('purpose') in {'repository_attribution', 'project_attribution', 'dynamic_project_attribution',
+                                                 'dimension_evidence_v3', 'dimension_evidence_v4', 'dimension_evidence_v5', 'dimension_evidence_v6', 'cached_attribution_v1'}:
+                        index = next(item['query_index'] for item in facts['candidates']
+                                     if item['id'] == action['source_id'])
+                    else:
+                        index = next(item['query_index'] for item in facts['candidates']
+                                     if _host(item['url']) == action['host'])
                 if 'link_result' in record:
                     if kind != 'supplement':
                         raise ComputerError('agent_evidence_changed')
@@ -263,6 +352,8 @@ class CompletionEnvironment(AgentEnvironment):
                 if 'observation' in record:
                     data = record['observation']
                     self._validate_page(data, item['url'])
+                    self._validate_project_document(record, item['url'],
+                        need['query'] if need else self.goal['queries'][item['query_index']])
                     excerpt = _selection(data['text'], need['query'] if need else self.goal['queries'][item['query_index']],
                                          [] if need else self.goal['required_terms'])
                     if record.get('excerpt') != excerpt or result['ok'] != (excerpt is not None):
@@ -298,7 +389,7 @@ class CompletionEnvironment(AgentEnvironment):
                     facts['failures'].append({'kind': kind, 'code': result['code'], 'captured_at': record['at']})
                     if checked is not None and len(facts['comparisons']) == 1 and result['code'] in REPAIRABLE:
                         facts['needs'] = self._needs(facts, checked)
-                    else:
+                    elif not (enabled_repair(self.goal) and retry_format(facts)):
                         facts['office_blocked'] = True
             else:
                 facts['office_started'] = True
@@ -324,6 +415,12 @@ class CompletionEnvironment(AgentEnvironment):
 
     def observe_final(self):
         facts = self._facts()
+        latest = facts['comparisons'][-1].get('comparison', {}) if facts['comparisons'] else {}
+        assessment = latest.get('assessment', {})
+        diagnostics = {key: deepcopy(assessment[key]) for key in (
+            'complete_independent_count', 'required_independent_count', 'group_details', 'publisher_evidence',
+            'publisher_support_reasons', 'publisher_scopes', 'publisher_scope_rejections')
+            if key in assessment}
         ready = self._raw_ready(facts)
         met = facts['comparison'] is not None and not facts['office_blocked'] and all(
             kind in facts['done'] for kind in self.goal['outputs'])
@@ -341,6 +438,8 @@ class CompletionEnvironment(AgentEnvironment):
                 'office_started': facts['office_started'], 'office_blocked': facts['office_blocked'],
                 'outputs_done': facts['done'], 'comparison_done': facts['comparison'] is not None,
                 'comparison_review': 'bounded_completion_v3',
+                'comparison_assessment': diagnostics,
+                'comparison_dimensions': list(self.goal['comparison']['dimensions']),
                 'evidence_sha256': digest([value for _, value in facts['records']]),
                 'checks': {'sources_ready': ready, 'goal_met': met}}
 
@@ -348,6 +447,11 @@ class CompletionEnvironment(AgentEnvironment):
         if observation != self.observe():
             raise ComputerError('agent_observation_changed')
         return deepcopy(self._frontier(self._facts()))
+
+    def _search_candidates(self, action, query):
+        return (self.search or SearchProcess(provider='bing', comparison=True)).search(
+            query, 2, should_stop=lambda: self.stop() or self.clock() >= self.deadline,
+            timeout=min(SEARCH_TIMEOUT, self.deadline - self.clock()))
 
     def execute(self, action, step_root):
         self._check()
@@ -382,9 +486,7 @@ class CompletionEnvironment(AgentEnvironment):
                         record['link_failure'] = str(exc)
                     self._check()
                 if discovery is None:
-                    discovery = (self.search or SearchProcess(provider='bing', comparison=True)).search(
-                        query, 2, should_stop=lambda: self.stop() or self.clock() >= self.deadline,
-                        timeout=min(SEARCH_TIMEOUT, self.deadline - self.clock()))
+                    discovery = self._search_candidates(action, query)
                 self._check()
                 discovery = validate_result(discovery, 2)
                 record['discovery'] = discovery
@@ -405,13 +507,17 @@ class CompletionEnvironment(AgentEnvironment):
             record['read_purpose'] = ({'purpose': 'supplement', 'need_id': need['need_id']}
                                       if need else {'purpose': 'initial'})
             try:
-                value = self._reader(query).read(
+                reader = self._reader(query)
+                value = reader.read(
                     item['url'], should_stop=lambda: self.stop() or self.clock() >= self.deadline)
                 self._check()
                 data = value.to_dict()
                 self._validate_page(data, item['url'])
                 excerpt = _selection(data['text'], query, [] if need else self.goal['required_terms'])
                 record.update(observation=data, excerpt=excerpt)
+                if getattr(reader, 'last_document_proof', None) is not None:
+                    record['document_proof'] = reader.last_document_proof
+                self._validate_project_document(record, item['url'], query)
                 result = {'ok': excerpt is not None, 'state': 'verified' if excerpt is not None else 'failed',
                           'code': 'source_verified' if excerpt is not None else 'quality_rejected'}
             except BrowserReadError as exc:

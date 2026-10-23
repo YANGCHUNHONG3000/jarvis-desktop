@@ -43,16 +43,36 @@ def _summary(steps, recipe=None):
                 # This fixed recipe retains every source column in order, so
                 # source and output coordinates coincide. Do not expose cells.
                 item["numeric_source_columns"] = list(data.get("sum_columns", []))
+            if recipe in {"workbook_audit_report", "document_structure_report"}:
+                item["coverage"] = "all_verified_source_records"
+                item["static_audit"] = True
+                item["limitations"] = (["formula_expressions_are_text", "no_executable_formulas",
+                                        "original_workbook_layout_not_reproduced"]
+                                       if recipe == "workbook_audit_report" else
+                                       ["text_and_topology_only", "original_word_layout_and_styles_not_reproduced"])
         elif action in {"document", "document_from_sheet"}:
             data = step.get("data", {})
             table = data.get("table", {})
             source_step = step.get("from")
-            if source_step is None and recipe in {"table_report", "document_table_report"}:
+            if source_step is None and recipe in {"table_report", "document_table_report",
+                                                 "document_table_transcription"}:
                 source_step = "s1"
             item.update(output=".docx", title=step.get("title", data.get("title")),
                         from_step=source_step,
                         paragraphs=len(step.get("paragraphs", data.get("paragraphs", []))),
                         table_rows=len(table.get("rows", [])) if type(table) is dict else 0)
+            if recipe in {"workbook_audit_report", "document_structure_report"}:
+                item["coverage"] = "all_verified_spreadsheet_rows"
+                item["static_audit"] = True
+                item["limitations"] = (["formula_expressions_are_text", "no_executable_formulas",
+                                        "original_workbook_layout_not_reproduced"]
+                                       if recipe == "workbook_audit_report" else
+                                       ["text_and_topology_only", "original_word_layout_and_styles_not_reproduced"])
+                if action == "document_from_sheet":
+                    source = next((prior.get("data", {}) for prior in steps
+                                   if prior.get("id") == source_step), {})
+                    item["table_rows"] = len(source.get("rows", []))
+                    item["table_columns"] = len(source.get("headers", []))
         elif action == "email_draft":
             item.update(output=".eml", subject=step.get("data", {}).get("subject"),
                         attached_steps=list(step.get("attachments", [])),

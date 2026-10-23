@@ -8,7 +8,7 @@ from .computer_goals import execute_goal, input_epoch, prepare_goal, propose_goa
 MODES = ('计算并记到新页', '把所选文字记到新页', '新建文字页', '选择资源管理器项目',
          '网页 → Excel → Word', '主题检索 → Excel → Word', '观察决策循环（浏览器与办公）',
          '网页点击输入／编辑已有 Word、Excel', '已读 GitHub → Word → 下一任务',
-         '自然语言编辑 Word/Excel', '多结果对比 → Excel → Word')
+         '自然语言编辑 Word/Excel', '多结果对比 → Excel → Word', '根据任务匹配技能／适配器')
 NAMES = {'calculate': '计算并核对实际显示', 'read_text': '读取实际文字',
          'new_note': '新建记事本页并回读', 'select_item': '选中项目并核对',
          'public_read': '浏览器读取公开网页', 'public_search': '公开检索并读取真实网页',
@@ -17,6 +17,9 @@ NAMES = {'calculate': '计算并核对实际显示', 'read_text': '读取实际�
 
 
 def describe(plan):
+    if plan.get('mode') == 'capability':
+        from .capability_router import describe as describe_capability
+        return describe_capability(plan)
     if plan.get('mode') == 'repository_document':
         from .repository_document import describe_repository_document
         return describe_repository_document(plan)
@@ -70,11 +73,15 @@ class GoalPanel:
         self.on_artifacts = lambda records: None
         self.interaction_request, self.interaction_fields = None, None
         self.comparison_goal, self.comparison_fields = None, None
+        self.comparison_source = None
+        self.comparison_recovery = False
         self.office_planning_files = ()
         self.office_artifact_refs = None
         self.office_scope = None
         self.get_artifacts = lambda: []
         self.repository_readings = []
+        self.capability_sources = []
+        self.development_panel = None
         self.windows, self.controls, self.snapshots = [], [], {}
         self.running = self.closed = False
         self.stopped = threading.Event()
@@ -112,6 +119,18 @@ class GoalPanel:
         self.scope_button.pack(side='left')
         self.recovery_button = ttk.Button(source_row, text='恢复连续任务…', command=self.list_recoveries)
         self.recovery_button.pack(side='left', padx=6)
+        comparison_row = ttk.Frame(tab)
+        comparison_row.pack(fill='x', pady=3)
+        self.comparison_source_button = ttk.Button(comparison_row, text='使用历史对比来源…',
+                                                   command=self.list_comparison_sources, state='disabled')
+        self.comparison_source_button.pack(side='left')
+        self.comparison_reset_button = ttk.Button(comparison_row, text='新建检索对比',
+                                                  command=self.reset_comparison_source, state='disabled')
+        self.comparison_reset_button.pack(side='left', padx=6)
+        self.development_button = ttk.Button(comparison_row, text='能力开发进度…', command=self.open_development)
+        self.development_button.pack(side='left', padx=6)
+        self.edit_adapter_button = ttk.Button(comparison_row, text='编辑适配器…', command=self.open_edit_adapter)
+        self.edit_adapter_button.pack(side='left', padx=6)
         self.control_label = ttk.Label(tab, text='读取文字或选择项目时，选择来源控件')
         self.control_label.pack(anchor='w')
         self.control = ttk.Combobox(tab, state='readonly')
@@ -151,6 +170,9 @@ class GoalPanel:
         interactive = self.mode.get() == MODES[7]
         office_intent = self.mode.get() == MODES[9]
         comparison = self.mode.get() == MODES[10]
+        self.pause_checkbox.configure(state='disabled' if self.mode.get() == MODES[11] else 'normal')
+        for widget in (self.comparison_source_button, self.comparison_reset_button):
+            widget.configure(state='normal' if comparison and not self.running else 'disabled')
         search = self.mode.get() in MODES[5:]
         self.expression_label.configure(text='文档标题（可留空使用主题，最多 200 字）' if search else '公开网页链接（最多 2 个，用空格分隔）' if adapter else '计算式（例如 12.5*4）；支持两个数的加减乘除')
         self.text_label.configure(text='检索主题；可选云端规划时填写完整任务描述（仅上传这里的文字）' if search else '文档标题／摘录主题（1～200 字）' if adapter else '新页文字（可留空使用默认文本）；云端规划时填写完整任务描述')
@@ -189,18 +211,75 @@ class GoalPanel:
             self.expression_label.configure(text='标题、检索主题和对比维度在“设置检索与对比范围”中填写。')
             self.text_label.configure(text='任务说明（可留空使用已保存的文档标题）')
             self.status.set('先设置对比范围，再本地预览；批准后检索真实候选，按来源原文生成对比表。')
+        if self.mode.get() == MODES[11]:
+            self.expression_label.configure(text='无需填写标题或指定技能名称。')
+            self.text_label.configure(text='完整任务说明（自动核对已有技能；只生成新文件）')
+            self.control_label.configure(text='上一任务成果（无需重新找文件；一次处理一份，批量修改使用自然语言编辑模式）')
+            self.propose_button.configure(state='disabled')
+            self.refresh_capability_sources()
+
+    def refresh_capability_sources(self):
+        if self.running or self.external_busy():
+            return
+        records = self.get_artifacts()
+        def work(_):
+            from .office_handoff import latest_generated_outputs, select_outputs
+            selected = records or latest_generated_outputs(stop=self.stopped.is_set)
+            return select_outputs(selected) if selected else []
+        self.start('capability_sources', work)
+
+    def preview_capability(self, instruction):
+        from .capability_router import prepare
+        index = self.control.current()
+        if not 0 <= index <= len(self.capability_sources):
+            raise ComputerError('请先选择来源或明确选择无来源')
+        ref = self.capability_sources[index - 1] if index else None
+        self.invalidate()
+        self.start('capability_preview', lambda s: prepare(s, instruction, source_ref=ref))
 
     def configure_comparison(self):
         if self.running or self.external_busy():
             return
+        if self.comparison_recovery:
+            self.status.set('恢复范围已固定，请批准剩余步骤；修改目标请先点“新建检索对比”。')
+            return
         from .comparison_panel import open_editor
         def saved(goal, fields):
             from .computer_agent import validate_goal
+            if self.comparison_source and goal['queries'] != self.comparison_source['manifest']['queries']:
+                raise ComputerError('历史来源的检索主题不能改变；请新建检索对比')
             self.comparison_goal = validate_goal(goal)
             self.comparison_fields = dict(fields)
             self.invalidate()
             self.status.set('对比范围已保存；请本地预览目标。')
-        open_editor(self.root, saved, self.comparison_fields)
+        if self.comparison_source:
+            open_editor(self.root, saved, self.comparison_fields, locked_queries=True)
+        else:
+            open_editor(self.root, saved, self.comparison_fields)
+
+    def list_comparison_sources(self):
+        if self.running or self.external_busy():
+            return
+        from .comparison_history import recent_candidates
+        self.invalidate()
+        self.start('comparison_candidates', lambda _: recent_candidates(stop=self.stopped.is_set))
+
+    def select_comparison_source(self, run):
+        if self.running or self.external_busy() or self.closed:
+            return
+        from .comparison_history import select_source
+        self.comparison_source = self.comparison_goal = self.comparison_fields = None
+        self.comparison_recovery = False
+        self.invalidate()
+        self.start('comparison_source', lambda _: select_source(run, stop=self.stopped.is_set))
+
+    def reset_comparison_source(self):
+        if self.running or self.external_busy():
+            return
+        self.comparison_source = self.comparison_goal = self.comparison_fields = None
+        self.comparison_recovery = False
+        self.invalidate()
+        self.status.set('已切换为新检索；请设置对比范围。历史成果保留。')
 
     def configure_office_intent(self):
         if self.running or self.external_busy():
@@ -315,10 +394,13 @@ class GoalPanel:
         if not value:
             self.cancel_human()
         self.on_busy(value)
-        self.pause_checkbox.configure(state='disabled' if value else 'normal')
+        self.pause_checkbox.configure(state='disabled' if value or self.mode.get() == MODES[11] else 'normal')
         self.output_edit_button.configure(state='disabled' if value else 'normal')
         self.scope_button.configure(state='disabled' if value else 'normal')
         self.recovery_button.configure(state='disabled' if value else 'normal')
+        self.development_button.configure(state='disabled' if value else 'normal')
+        for widget in (self.comparison_source_button, self.comparison_reset_button):
+            widget.configure(state='normal' if not value and self.mode.get() == MODES[10] else 'disabled')
         self.interaction_button.configure(state='normal' if not value and self.mode.get()==MODES[7] else 'disabled')
         if not value and self.mode.get() in (MODES[9], MODES[10]):
             self.interaction_button.configure(state='normal')
@@ -329,7 +411,7 @@ class GoalPanel:
         if not value and self.mode.get() in MODES[4:]:
             for widget in (self.source, self.destination, self.control):
                 widget.configure(state='disabled')
-            if self.mode.get() == MODES[8]:
+            if self.mode.get() in (MODES[8], MODES[11]):
                 self.control.configure(state='readonly')
         self.execute_button.configure(state='disabled')
 
@@ -398,12 +480,27 @@ class GoalPanel:
             return
         try:
             text, expression, mode = self.text.get('1.0', 'end-1c'), self.expression.get(), self.mode.get()
+            if mode == MODES[11]:
+                self.preview_capability(text.strip())
+                return
             if mode == MODES[10]:
                 from .computer_agent import prepare
+                if self.comparison_recovery:
+                    self.status.set('当前是恢复预览，直接批准将仅续做剩余步骤；改目标请先新建检索对比。')
+                    return
                 if self.comparison_goal is None:
                     raise ComputerError('请先设置检索与对比范围')
                 if self.session is None:
                     self.session = ComputerSession.create(host=self.host)
+                if self.comparison_source:
+                    from copy import deepcopy
+                    from .comparison_history import prepare_selected
+                    goal, selection = deepcopy(self.comparison_goal), deepcopy(self.comparison_source)
+                    instruction = text.strip() or goal['title']
+                    self.invalidate()
+                    self.start('comparison_preview', lambda s: prepare_selected(
+                        s, instruction, goal, selection, stop=self.stopped.is_set))
+                    return
                 self.show_plan(prepare(self.session, text.strip() or self.comparison_goal['title'],
                                        self.comparison_goal))
                 self.status.set('请核对来源数、网站数和维度；批准后读取真实结果并选取原文，保存 Excel 和 Word。')
@@ -487,6 +584,20 @@ class GoalPanel:
         self.invalidate()
         self.start('recovery_candidates', lambda _: recent_candidates(stop=self.stopped.is_set))
 
+    def open_development(self):
+        if self.running or self.external_busy() or self.closed:
+            return
+        from .development_panel import DevelopmentPanel
+        if self.development_panel and not self.development_panel.closed:
+            self.development_panel.window.lift()
+            return
+        self.invalidate()
+        self.development_panel = DevelopmentPanel(self)
+
+    def open_edit_adapter(self):
+        from .office_edit_adapter_panel import open_panel
+        open_panel(self)
+
     def select_recovery(self, row):
         if self.running or self.external_busy() or self.closed or self.stopped.is_set():
             return
@@ -542,6 +653,13 @@ class GoalPanel:
     def execute(self):
         if self.running or self.external_busy() or self.plan is None:
             return
+        if self.plan.get('mode') == 'capability':
+            from .capability_router import execute
+            plan = self.plan
+            self.invalidate()
+            self.start('capability_execute', lambda s: execute(s, plan,
+                approval=plan['sha256'], stop=self.stopped.is_set))
+            return
         if self.plan.get('mode') == 'repository_document':
             from .repository_document import execute_repository_document
             plan = self.plan
@@ -556,6 +674,29 @@ class GoalPanel:
             return
         plan = self.plan
         agent_options = None
+        from .office_edit_adapter_panel import uses_adapter, execute as execute_edit_adapter
+        if uses_adapter(self.session,plan):
+            if 'recovery' in plan:
+                from . import office_edit_adapter
+                if office_edit_adapter.owns_recovery(office_edit_adapter.DEFAULT_STORE,self.session,plan) is None:
+                    self.open_edit_adapter()
+                    return
+            if 'recovery' not in plan:
+                from . import office_edit_adapter
+                try:
+                    stage=office_edit_adapter.status(office_edit_adapter.DEFAULT_STORE,office_edit_adapter.current_candidate())
+                    if stage['remaining'] <= 0:
+                        self.open_edit_adapter()
+                        return
+                except (ValueError,OSError):
+                    self.open_edit_adapter()
+                    return
+            pause_requested = bool(self.pause_each_step.get())
+            self.invalidate()
+            self.start('execute', lambda s: execute_edit_adapter(self,s,plan,
+                progress=lambda p: self.messages.put(('progress',p,None)),
+                pause_after_step=lambda:pause_requested))
+            return
         if plan.get('mode') == 'agent':
             # Read Tk state on the UI thread; workers receive only a captured bool.
             pause_requested = bool(self.pause_each_step.get())
@@ -607,6 +748,8 @@ class GoalPanel:
 
     def stop(self):
         self.stopped.set()
+        if self.development_panel and self.development_panel.running:
+            self.development_panel.stop_event.set()
         self.cancel_human()
         self.invalidate(True)
         self.status.set('已请求停止；已完成的操作会保留，不会重放或回滚。')
@@ -614,6 +757,9 @@ class GoalPanel:
     def close(self):
         self.closed = True
         self.stopped.set()
+        if self.development_panel and not self.development_panel.closed:
+            self.development_panel.stop_event.set()
+            self.development_panel.close()
         self.cancel_human()
         if self.poll_id is not None:
             self.root.after_cancel(self.poll_id)
@@ -663,7 +809,24 @@ class GoalPanel:
                     self.status.set(f"正在执行 {result['step']}/{result['total']}：{NAMES[result['op']]}" + hint)
                     continue
                 self.set_busy(False)
-                if kind == 'repository_document' and result:
+                if kind == 'edit_adapter_state' and result:
+                    from .office_edit_adapter_panel import describe_state
+                    self.show_text(describe_state(result))
+                    self.status.set('编辑适配器阶段已记录；打开“编辑适配器…”可继续。')
+                elif kind == 'capability_execute' and result:
+                    from .capability_router import describe_result
+                    self.invalidate(True)
+                    detail = describe_result(result)
+                    self.show_text(detail + '\n记录：' + result['run'])
+                    self.status.set('产物已通过回读核验，请核对任务要求。' if result['ok'] else '任务未完成，原因与下一步见上方。')
+                    if result['ok'] and result.get('artifacts'):
+                        try:
+                            self.on_artifacts(result['artifacts'])
+                            self.show_text(detail + '\nOffice 成果已自动接入下一任务。\n记录：' + result['run'])
+                        except Exception:
+                            self.show_text(detail + '\n成果已保存，但自动接力未完成。\n记录：' + result['run'])
+                            self.status.set('成果已保存，自动接力未完成；可从历史任务重新选用。')
+                elif kind == 'repository_document' and result:
                     self.invalidate(True)
                     if result['ok']:
                         self.show_text('GitHub 页面资料已整理为 Word，文件与原生回读均通过。\n' +
@@ -717,11 +880,54 @@ class GoalPanel:
                                 self.status.set(status + '；自动接力未完成，成果已保存，可从历史任务重新选用。')
                     else:
                         self.show_text('\n'.join([status, '新建记事本页未保存到文件。', *[f"{k} = {v}" for k, v in result['outputs'].items()]]))
+                    if not result['ok']:
+                        from .task_diagnostics import explain_outcome
+                        self.show_text(status + '\n' + explain_outcome(result,
+                            assessment=result.get('comparison_assessment'),
+                            dimensions=result.get('comparison_dimensions', ())) + '\n记录：' + result['run'])
                 elif error or self.stopped.is_set():
                     self.invalidate(True)
-                    self.status.set('未完成：' + (error or '已停止') + '。需要重新读取和预览。')
+                    if error in {'comparison_seed_invalid', 'comparison_seed_changed'}:
+                        self.comparison_source = self.comparison_goal = self.comparison_fields = None
+                        self.status.set('历史来源核验未通过：文件已变化、证据不完整或接力层级不支持。未重跑旧步骤；请另选来源。')
+                    elif error and error.startswith('edit_adapter_'):
+                        self.status.set('编辑适配器尚未通过当前阶段：'+error+'。请打开“编辑适配器…”查看测试、审查、试运行或限用状态；原文件未覆盖。')
+                    else:
+                        self.status.set('未完成：' + (error or '已停止') + '。需要重新读取和预览。')
+                elif kind == 'capability_sources':
+                    self.capability_sources = result
+                    self.control.configure(state='readonly', values=['无来源文件'] +
+                        [f"{n}. {ref['artifact']}" for n, ref in enumerate(result, 1)])
+                    self.control.current(len(result) if result else 0)
+                    self.status.set('已自动带入上一任务成果；确认所选来源并填写完整任务，先本地预览。')
+                elif kind == 'capability_preview':
+                    self.show_plan(result)
+                    self.status.set('本地预览完成；批准后再调用模型匹配技能或现有适配器。')
                 elif kind == 'generated_artifacts':
                     self.use_generated_artifacts(result)
+                elif kind == 'comparison_candidates':
+                    if result:
+                        from .comparison_history import open_selector
+                        open_selector(self.root, result, self.select_comparison_source)
+                    self.status.set('请选择历史任务，再核验捕获。' if result else '最近记录中没有可选的已完成对比任务。')
+                elif kind == 'comparison_source':
+                    from copy import deepcopy
+                    from .comparison_history import source_description
+                    self.comparison_source = deepcopy(result)
+                    self.comparison_goal, self.comparison_fields = deepcopy(result['goal']), dict(result['fields'])
+                    self.comparison_recovery = False
+                    self.mode.set(MODES[10])
+                    self.mode_changed()
+                    self.text.delete('1.0', 'end')
+                    self.text.edit_modified(False)
+                    self.show_text(source_description(result))
+                    self.status.set(f"已核验 {len(result['pages'])} 页历史捕获。可设置新维度，再本地预览；尚未调用模型。")
+                elif kind == 'comparison_preview':
+                    self.show_plan(result)
+                    if self.comparison_source:
+                        from .comparison_history import source_description
+                        self.show_text(describe(result) + '\n' + source_description(self.comparison_source))
+                    self.status.set('历史来源已重新核验。批准后重新复核维度、按需补查并生成 Word/Excel；成果自动接力。')
                 elif kind == 'recovery_candidates':
                     if result:
                         from .interaction_recovery_panel import open_selector
@@ -730,6 +936,8 @@ class GoalPanel:
                                     '最近记录中没有未完成的浏览器／办公连续任务。')
                 elif kind == 'recovery_preview':
                     self.session = ComputerSession(result['session_root'],host=self.host)
+                    self.comparison_source = None
+                    self.comparison_recovery = 'comparison' in result['plan'].get('goal', {})
                     self.office_planning_files, self.office_artifact_refs, self.office_scope = (), None, None
                     goal = result['plan'].get('goal', {})
                     mode_index = 10 if 'comparison' in goal else 6 if 'queries' in goal else 7 if goal.get('browser') else 9

@@ -72,6 +72,7 @@ def call_model(context, callback):
     # Local run paths and provenance belong to the canonical input binding, not
     # the public evidence uploaded to the model.
     wire['goal']['comparison'].pop('seed', None)
+    wire['goal']['comparison'].pop('capture_import', None)
     for source in wire['sources']:
         source['id'] = forward[source['id']]
     review = 'selection' in wire
@@ -98,6 +99,21 @@ def call_model(context, callback):
     fields = {'id', 'publisher', 'cells'} if review else {'id', 'spans'}
     for row in _rows(response['sources'], reverse, fields):
         row['id'] = reverse[row['id']]
+        if review:
+            from .publisher_roles import enabled as role_policy, candidates
+            if role_policy(context['goal']):
+                source = next(s for s in context['sources'] if s['id'] == row['id'])
+                choices = candidates(source)
+                if source.get('project_role_candidates') != choices:
+                    _fail()
+                publisher = row['publisher']
+                if choices and publisher is not None:
+                    if (type(publisher) is not dict or set(publisher) != {'candidate_index'}
+                            or type(publisher['candidate_index']) is not int
+                            or not 0 <= publisher['candidate_index'] < len(choices)):
+                        _fail()
+                    chosen = choices[publisher['candidate_index']]
+                    row['publisher'] = {key: chosen[key] for key in ('name', 'quote')}
     if review:
         for pair in _pairs(response['pairs'], reverse):
             pair['left'], pair['right'] = reverse[pair['left']], reverse[pair['right']]

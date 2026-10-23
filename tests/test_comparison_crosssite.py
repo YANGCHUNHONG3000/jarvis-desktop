@@ -29,7 +29,7 @@ def v4(tool_ctx, monkeypatch):
              'observation': data, 'excerpt': _selection(texts[url], 'Editing', []),
              'result': {'ok': True, 'state': 'verified', 'code': 'source_verified'},
              'read_purpose': {'purpose': 'initial'}, 'at': STAMP}))
-    seed = {'queries': ['first', 'second'], 'source_ids': [i['id'] for i, _ in captured]}
+    seed = {'version': 1, 'queries': ['first', 'second'], 'source_ids': [i['id'] for i, _ in captured]}
     monkeypatch.setattr(comparison_seed, 'validate_manifest', lambda m: deepcopy(m))
     monkeypatch.setattr(comparison_seed, 'load_seed', lambda m: deepcopy(captured))
     c['goal'].update(min_sources=2, required_terms=[], comparison={

@@ -25,8 +25,19 @@ def test_active_owner_display_cannot_offer_parallel_recovery():
     row = {'run':'saved-run','eligible':False,'code':'run_owner_active'}
     assert recovery_ui.candidate_label(row).startswith('已阻止')
     assert '暂不能同时恢复' in recovery_ui.candidate_detail(row)
+    assert '原始代码：run_owner_active' in recovery_ui.candidate_detail(row)
     assert '原执行已停止' not in recovery_ui.candidate_detail(row)
     assert recovery_ui.candidate_detail(None) == '选择任务后核验来源和原生回执。'
+
+
+def test_unsafe_recovery_display_names_reason_and_keeps_original_code():
+    row = {'run':'saved-run', 'eligible':False,
+           'code':'recovery_dispatched_action_not_verified',
+           'instruction':'继续办公编辑'}
+    detail = recovery_ui.candidate_detail(row)
+    assert '结果未知，不能重放' in detail
+    assert '当前不视为已安全恢复' in detail
+    assert '原始代码：recovery_dispatched_action_not_verified' in detail
 
 
 def test_list_recoveries_routes_local_candidates_and_guards_busy(monkeypatch):

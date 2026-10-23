@@ -53,14 +53,14 @@ def candidate_label(row):
 def candidate_detail(row):
     if row is None:
         return '选择任务后核验来源和原生回执。'
-    if row['eligible']:
-        detail = ('原任务未写最终结果；已确认原执行已停止，已完成步骤的回执已核验。\n'
-                  if row.get('interrupted_without_outcome') else '')
-        detail += '可生成新的恢复预览，不会重跑已完成步骤。'
-    else:
-        code = row.get('code','recovery_unavailable')
-        detail = ('原任务仍在运行或清理，暂不能同时恢复。' if code == 'run_owner_active'
-                  else '不能安全恢复，原因：'+code)
+    from .task_diagnostics import explain_recovery
+
+    detail = ('原任务未写最终结果；已确认原执行已停止，已完成步骤的回执已核验。\n'
+              if row.get('eligible') and row.get('interrupted_without_outcome') else '')
+    detail += explain_recovery(row)
+    code = row.get('code')
+    if code:
+        detail += f'\n原始代码：{code}'
     return f"任务：{row.get('instruction','')}\n记录：{row['run']}\n"+detail
 
 
@@ -76,7 +76,7 @@ def open_selector(root, rows, on_selected):
     box.pack(fill='both',expand=True,padx=12)
     for row in rows:
         box.insert(tk.END,candidate_label(row))
-    detail = tk.Text(win,height=5,wrap='word',state='disabled')
+    detail = tk.Text(win,height=8,wrap='word',state='disabled')
     detail.pack(fill='x',padx=12,pady=6)
     def show(_event=None):
         indices = box.curselection()

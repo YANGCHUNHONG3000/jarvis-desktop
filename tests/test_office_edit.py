@@ -93,7 +93,7 @@ def test_original_and_snapshot_changes_rejected(tmp_path, kind):
         edit._bind(spec, root)
 
 
-def test_complex_word_target_refused_before_output(tmp_path):
+def test_cross_run_word_rewrite_refused_before_output(tmp_path):
     path = tmp_path / "original.docx"
     word_fixture(path, complex_target=True)
     root = tmp_path / "input"
@@ -101,8 +101,8 @@ def test_complex_word_target_refused_before_output(tmp_path):
     source = edit.snapshot_edit_source(path, root)
     spec = {"kind": "document", "source_id": "selected-edit", "source_sha256": source["sha256"],
             "changes": [{"paragraph_index": 1, "before": "预算待确认复杂格式", "after": "新文本"}]}
-    assert source["observed"]["paragraphs"][1]["editable"] is False
-    with pytest.raises(edit.EditError, match="edit_before_mismatch"):
+    assert source["observed"]["paragraphs"][1]["editable"] is True
+    with pytest.raises(edit.EditError, match="edit_word_complex"):
         edit._bind(spec, root)
 
 

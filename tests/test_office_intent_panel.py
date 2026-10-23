@@ -62,6 +62,9 @@ def panel_stub():
     panel.propose_button = Value()
     panel.scope_button = Value()
     panel.recovery_button = Value()
+    panel.pause_checkbox = Value()
+    panel.comparison_source_button = Value()
+    panel.comparison_reset_button = Value()
     panel.show_text = lambda text: ui.GoalPanel.show_text(panel, text)
     panel.invalidate = lambda clear_snapshots=False: ui.GoalPanel.invalidate(panel, clear_snapshots)
     return panel

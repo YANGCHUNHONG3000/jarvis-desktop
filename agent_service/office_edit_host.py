@@ -69,6 +69,8 @@ def execute_edit_supervised(spec, root, source_root, stop=lambda: False, deadlin
             if type(result) is not dict or type(result.get("ok")) is not bool:
                 raise ValueError("edit_outcome_invalid")
             if result["ok"]:
+                if process.returncode != 0:
+                    raise ValueError("edit_worker_exited")
                 if Path(result["artifact"]).parent != root:
                     raise ValueError("edit_outcome_owner_invalid")
                 verify_edit_result(result, source_root, spec)
@@ -97,7 +99,8 @@ def worker(root, seconds):
     cancelled, finished = threading.Event(), threading.Event()
     deadline = time.monotonic() + seconds
     def watch_parent():
-        sys.stdin.buffer.read(1)
+        # Avoid a daemon holding BufferedReader's lock at interpreter shutdown.
+        os.read(sys.stdin.fileno(), 1)
         if not finished.is_set():
             cancelled.set()
     def watchdog():

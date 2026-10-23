@@ -2,6 +2,7 @@
 from copy import deepcopy
 from hashlib import sha256
 import json
+import os
 
 import pytest
 
@@ -154,3 +155,34 @@ def test_history_output_batch_must_bind_current_run(selected,tmp_path):
     with pytest.raises(ComputerError,match='office_handoff_history_invalid'):
         handoff.latest_generated_outputs(base=base)
     assert calls==[]
+
+
+def test_restart_picks_new_capability_batch_and_rejects_latest_tampering(selected, tmp_path, monkeypatch):
+    from agent_service import capability_router as router
+
+    session, _, records, _, calls = selected
+    task_base = tmp_path / 'tasks'
+    plan = router.prepare(session, '复制表格', task_base=task_base)
+    monkeypatch.setattr(router, '_inspect', lambda task, base: {
+        'ok': True, 'state': 'succeeded', 'code': 'capability_verified',
+        'task_root': str(task), 'artifacts': records, 'skill': None, 'gap': None,
+        'result_sha256': 'a' * 64,
+    })
+    router.execute(session, plan, approval=plan['sha256'], task_base=task_base,
+                   client=object(), runner=lambda *args, **kwargs: None)
+    latest = session.root / 'goals' / (plan['sha256'] + '.capability') / 'outcome.json'
+    old = session.root / 'goals' / 'old.run' / 'outcome.json'
+    old.parent.mkdir()
+    old.write_text(json.dumps({'engine': 'observed_agent', 'state': 'verified',
+                               'ok': True, 'run': str(old.parent), 'artifacts': [records[0]]}),
+                   encoding='utf-8')
+    os.utime(old, ns=(100, 100))
+    os.utime(latest, ns=(200, 200))
+
+    assert handoff.latest_generated_outputs(base=session.root.parent, task_base=task_base) == records
+    assert calls == [item['path'] for item in records]
+
+    saved = json.loads(latest.read_text(encoding='utf-8'))
+    latest.write_text(json.dumps({**saved, 'artifacts': [records[0]]}), encoding='utf-8')
+    with pytest.raises(ComputerError, match='capability_result_changed'):
+        handoff.latest_generated_outputs(base=session.root.parent, task_base=task_base)

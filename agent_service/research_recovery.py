@@ -1,5 +1,6 @@
 """Single-use research continuations from acknowledged captured evidence."""
 from copy import deepcopy
+from collections import OrderedDict
 from pathlib import Path
 import re
 import time
@@ -10,6 +11,100 @@ from .computer_goal_adapters import TASK_BASE
 
 MAX_DEPTH = 4
 _SHA = re.compile(r'[0-9a-f]{64}\Z')
+_VERIFIED = OrderedDict()
+_CACHE_LIMIT = 4
+
+
+def _verification_snapshot(session, root, *, child, allow_unclaimed):
+    """Rehash every bounded dependency; snapshots never establish eligibility.
+
+    Only a successful production replay can populate the cache. In particular,
+    neither timestamps nor the seed loaders' own caches substitute for these
+    bytes, current leases, continuation claims, or native output inventories.
+    """
+    from .computer import ComputerSession
+    from .interaction_recovery import _run_root, _claim, _hash, _inventory
+    from .run_lifecycle import assert_inactive
+    from .comparison_seed import _run_root as seed_root
+    snapshots, visiting, node_count = {}, set(), 0
+
+    def tree(target, *, exclude=()):
+        files = _inventory(target, exclude=exclude)
+        directories = []
+        for path in target.rglob('*'):
+            safe_root(path)
+            if path.is_dir():
+                directories.append(path.relative_to(target).as_posix())
+                if len(directories) > 256:
+                    raise ComputerError('recovery_evidence_limit')
+        return {'files': files, 'directories': sorted(directories)}
+
+    def visit(target, owner, *, research, expected_child=None, unclaimed=False):
+        nonlocal node_count
+        target = _run_root(owner, target) if research else seed_root(target)
+        if research:
+            _claim(target, expected_child, unclaimed)
+        name = str(target) + ('|research' if research else '|seed')
+        if str(target) in visiting:
+            raise ComputerError('recovery_lineage_depth')
+        if name in snapshots:
+            return
+        if node_count >= 32:
+            raise ComputerError('recovery_evidence_limit')
+        node_count += 1
+        claim = read_record(target / 'claim.json')
+        if ('lifecycle' in claim or (target / 'owner.json').exists()
+                or (target / 'owner.lease').exists()):
+            assert_inactive(target)
+        plan = read_record(target.with_suffix('.json'))
+        outcome = read_record(target / 'outcome.json')
+        artifacts = outcome.get('artifacts')
+        if type(artifacts) is not list or len(artifacts) > 2:
+            raise ComputerError('recovery_evidence_changed')
+        outputs = {}
+        for artifact in artifacts:
+            task, output = safe_root(artifact['task_root']), safe_root(artifact['path'])
+            lock = output.with_name('~$' + output.name).relative_to(task).as_posix()
+            outputs[str(task)] = tree(task, exclude=(lock,))
+        continuation = target / 'continuation-claim.json'
+        snapshots[name] = {'plan': _hash(target.with_suffix('.json')),
+            'run': tree(target, exclude=('continuation-claim.json',) if research else ()),
+            'claim': read_record(continuation) if research and continuation.exists() else None,
+            'outputs': outputs}
+        comparison = plan['goal'].get('comparison', {})
+        if 'capture_import' in comparison:
+            from .comparison_capture_import import fingerprint
+            snapshots[name]['capture_import'] = fingerprint(comparison['capture_import'], comparison.get('seed'))
+        visiting.add(str(target))
+        meta = plan.get('recovery')
+        if 'recovery' in plan:
+            if type(meta) is not dict:
+                raise ComputerError('recovery_metadata_invalid')
+            visit(meta['parent_run'], owner, research=True,
+                  expected_child=plan['sha256'])
+        ancestor = plan['goal'].get('comparison', {}).get('seed')
+        if ancestor is not None:
+            if type(ancestor) is not dict or ancestor.get('version') not in {1, 2, 3, 4, 5}:
+                raise ComputerError('recovery_evidence_changed')
+            imported = seed_root(ancestor['run'])
+            if ancestor['version'] == 5:
+                from .comparison_compact_seed import validate_manifest, _graph
+                manifest = validate_manifest(ancestor)
+                name = str(imported) + '|compact'
+                if name not in snapshots:
+                    graph = _graph(imported)
+                    if node_count + len(graph['nodes']) > 32:
+                        raise ComputerError('recovery_evidence_limit')
+                    node_count += len(graph['nodes'])
+                    snapshots[name] = graph
+                if snapshots[name] != manifest['dependency_graph']:
+                    raise ComputerError('recovery_evidence_changed')
+            else:
+                visit(imported, ComputerSession(imported.parent.parent), research=False)
+        visiting.remove(str(target))
+
+    visit(root, session, research=True, expected_child=child, unclaimed=allow_unclaimed)
+    return snapshots
 
 
 def _plan(session, run):
@@ -54,6 +149,39 @@ def _lineage(session, plan, *, claimed, seen=()):
 
 
 def _inspect(session, run, *, child=None, allow_unclaimed=False, seen=()):
+    from .interaction_recovery import _run_root
+    root = _run_root(session, run)
+    if str(root) in seen or len(seen) > MAX_DEPTH:
+        raise ComputerError('recovery_lineage_depth')
+    try:
+        before = _verification_snapshot(session, root, child=child, allow_unclaimed=allow_unclaimed)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:
+        if isinstance(exc, ComputerError) and str(exc) in {
+                'comparison_capture_import_changed', 'comparison_capture_import_invalid'}:
+            raise
+        # Unknown graph shapes retain the original full verification path and
+        # its diagnostic; they never gain authority through this optimization.
+        before = None
+    key = (str(root), child, allow_unclaimed, tuple(seen), digest(before))
+    if before is not None and key in _VERIFIED:
+        result = deepcopy(_VERIFIED[key])
+        if _verification_snapshot(session, root, child=child, allow_unclaimed=allow_unclaimed) != before:
+            raise ComputerError('recovery_evidence_changed')
+        _VERIFIED.move_to_end(key)
+        return result
+    result = _inspect_verified(session, root, child=child, allow_unclaimed=allow_unclaimed,
+                               seen=seen, reuse_facts=before is not None)
+    if before is not None:
+        if _verification_snapshot(session, root, child=child, allow_unclaimed=allow_unclaimed) != before:
+            raise ComputerError('recovery_evidence_changed')
+        _VERIFIED[key] = deepcopy(result)
+        _VERIFIED.move_to_end(key)
+        while len(_VERIFIED) > _CACHE_LIMIT:
+            _VERIFIED.popitem(last=False)
+    return result
+
+
+def _inspect_verified(session, run, *, child=None, allow_unclaimed=False, seen=(), reuse_facts=False):
     from .interaction_recovery import _run_root, _claim, _hash, _inventory
     root = _run_root(session, run)
     if str(root) in seen or len(seen) > MAX_DEPTH:
@@ -70,12 +198,25 @@ def _inspect(session, run, *, child=None, allow_unclaimed=False, seen=()):
         raise ComputerError('recovery_terminal_state_not_safe')
     seed = _lineage(session, plan, claimed=True, seen=(*seen, str(root)))
     records, origins, attempts = list(seed['records']), deepcopy(seed['origins']), []
-    for step in sorted(root.glob('step-*')):
+    steps, pending, gaps = sorted(root.glob('step-*')), None, []
+    for step in steps:
         if not re.fullmatch(r'step-(0[1-9]|1[0-2])', step.name) or not step.is_dir():
             raise ComputerError('recovery_step_invalid')
         if not (step / 'environment-intent.json').exists():
-            if any((step / name).exists() for name in ('intent.json', 'environment-result.json', 'verification.json')):
+            if not (step / 'intent.json').exists():
+                # Preserve the old pre-selection contract: an empty directory,
+                # choices alone, or an uncommitted decision never dispatched.
+                if any((step / name).exists() for name in ('environment-result.json', 'verification.json')):
+                    raise ComputerError('recovery_evidence_incomplete')
+                gaps.append(step)
+                continue
+            entries = list(step.iterdir())
+            if (pending is not None or gaps or step != steps[-1]
+                    or int(step.name[5:]) != len(attempts) + 1
+                    or {entry.name for entry in entries} != {'choices.json', 'decision.json', 'intent.json'}
+                    or any(not entry.is_file() for entry in entries)):
                 raise ComputerError('recovery_evidence_incomplete')
+            pending = step
             continue
         if not all((step / name).is_file() for name in ('environment-result.json', 'intent.json', 'verification.json')):
             raise ComputerError('recovery_dispatched_action_not_verified')
@@ -98,10 +239,19 @@ def _inspect(session, run, *, child=None, allow_unclaimed=False, seen=()):
              for record, _ in records if record['action']['kind'] in {'spreadsheet', 'document'}}
     if len(bases) > 1:
         raise ComputerError('recovery_source_owner_invalid')
-    env = AgentEnvironment(plan['goal'], root, stop=lambda: False, deadline=float('inf'),
-                           task_base=next(iter(bases), TASK_BASE),
-                           recovery_validator=lambda: seed)
+    # Reconstruction is read-only even if environment-goal.json disappears
+    # concurrently; the ordinary constructor would recreate that receipt.
+    env = AgentEnvironment.__new__(AgentEnvironment, plan['goal'])
+    env.__dict__.update(goal=deepcopy(plan['goal']), run=root, stop=lambda: False,
+        deadline=float('inf'), clock=time.monotonic, search=None, browser=None,
+        office_execute=None, task_base=safe_root(next(iter(bases), TASK_BASE)),
+        recovery_validator=lambda: seed, comparison_select=None, comparison_review=None,
+        record_origins={})
     facts = env._facts()
+    if reuse_facts:
+        # This instance exists only for this synchronous inspection; entry and
+        # exit snapshots still bind every dependency around the full replay.
+        env._facts = lambda: facts
     if facts['records'] != records or env.record_origins != origins or facts['office_blocked']:
         raise ComputerError('recovery_evidence_changed')
     if (outcome.get('attempts') != attempts or outcome.get('completed') != [a for a in attempts if a['result']['ok']]
@@ -122,6 +272,11 @@ def _inspect(session, run, *, child=None, allow_unclaimed=False, seen=()):
                     if item['id'] not in facts['reads']])
     else:
         actions = []
+    if pending is not None:
+        from .computer_agent import checked_observation
+        observation = checked_observation(env.observe_final())
+        actions = env.actions(observation)
+        _validate_pre_dispatch(root, pending, observation, actions)
     if not actions:
         raise ComputerError('recovery_nothing_remaining')
     done = [_label(row['action']) for row, _ in records]
@@ -139,6 +294,21 @@ def _inspect(session, run, *, child=None, allow_unclaimed=False, seen=()):
             'done': done, 'remaining': remaining, 'artifacts': facts['artifacts'],
             'records': records, 'origins': origins, 'depth': seed['depth'],
             'evidence_sha256': digest(evidence)}
+
+
+def _validate_pre_dispatch(root, step, observation, actions):
+    """Validate an engine selection which never reached an effect dispatcher."""
+    from .computer_agent import choices_for
+    state_hash, choices = choices_for(root, observation, actions)
+    recorded = read_record(step / 'choices.json')
+    decision = read_record(step / 'decision.json')
+    chosen = read_record(step / 'intent.json')
+    if (recorded != {'state_sha256': state_hash, 'choices': choices}
+            or type(decision) is not dict or set(decision) != {'method', 'choice', 'state_sha256'}
+            or decision['state_sha256'] != state_hash or decision['choice'] != chosen
+            or chosen not in choices or chosen['action'].get('kind') not in {'search', 'read', 'supplement', 'compare'}
+            or decision['method'] != ('single_legal_action' if len(choices) == 1 else 'model_choice')):
+        raise ComputerError('recovery_pre_dispatch_changed')
 
 
 def _output_inventory(record):

@@ -39,13 +39,26 @@ def prepare_reference(artifact, expected_sha256, base):
             'manifest_sha256':manifest_hash,'receipt_sha256':record_hash}
 
 
-def snapshot_reference(ref, task_root, base, *, stop=lambda:False, deadline=None):
+def snapshot_reference(ref, task_root, base, *, stop=lambda:False, deadline=None,
+                       full_workbook=False):
     from . import office_source, task_history
     if type(ref) is not dict or set(ref) != {'version','kind','artifact','sha256','manifest_sha256','receipt_sha256'}:
         raise ValueError('edited_artifact_ref_invalid')
     if prepare_reference(ref['artifact'],ref['sha256'],base) != ref:
         raise ValueError('edited_artifact_ref_changed')
     root = task_history._task(task_root,task_history._base(base))
+    if Path(ref['artifact']).name == 'edited-spreadsheet.xlsx':
+        from .source_intake import needs_workbook_source
+        if full_workbook or needs_workbook_source(ref['artifact']):
+            from .verified_edit_workbook import snapshot_reference as snapshot_workbook
+            return snapshot_workbook(ref,root,base,stop=stop,deadline=deadline)
+        from .generated_edit_table import snapshot_if_generated
+        result = snapshot_if_generated(ref,root,base,stop=stop,deadline=deadline)
+        if result is not None:
+            return result
+    if Path(ref['artifact']).name == 'edited-document.docx':
+        from .verified_edit_document import snapshot_reference as snapshot_document
+        return snapshot_document(ref, root, base, stop=stop, deadline=deadline)
     from .source_intake import snapshot_selected_source
     result = snapshot_selected_source(ref['artifact'],root,stop=stop,deadline=deadline)
     if result['sha256'] != ref['sha256'] or prepare_reference(ref['artifact'],ref['sha256'],base) != ref:

@@ -15,7 +15,7 @@ def test_candidate_capacity_blocks_discovery_before_effect():
     from agent_service.comparison_completion import CompletionEnvironment
     from unittest.mock import patch
     env = object.__new__(CrossSiteEnvironment)
-    env.goal = {'outputs': ['spreadsheet', 'document']}
+    env.goal = {'outputs': ['spreadsheet', 'document'], 'comparison': {'evidence_version': 4}}
     facts = {'candidates': [{}] * 7, 'active_ids': ['new'],
              'comparisons': [{'active_ids': ['old']}], 'records': []}
     with patch.object(CompletionEnvironment, '_frontier', return_value=[{'kind': 'supplement'}]):

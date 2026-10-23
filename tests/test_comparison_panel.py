@@ -143,3 +143,105 @@ def test_recovery_uses_comparison_mode_and_restores_scope(panel, tmp_path):
     assert panel.comparison_goal == goal and panel.plan == plan
     assert build_goal(panel.comparison_fields) == goal
     assert panel.text.get('1.0', 'end-1c') == '继续对比'
+
+
+def selection():
+    goal = build_goal(values())
+    return {'manifest': {'queries': goal['queries'], 'run': 'source.run', 'source_ids': ['s1', 's2']},
+            'goal': goal, 'fields': values(), 'pages': [{'url': 'https://example.org/', 'query_index': 0}]}
+
+
+def test_source_event_revokes_old_plan_and_locks_queries(panel, monkeypatch):
+    from agent_service import comparison_panel
+    chosen = selection()
+    panel.plan = {'old': True}
+    panel.text.insert('1.0', 'old instruction')
+    panel.messages.put(('comparison_source', chosen, None))
+    panel.poll()
+    assert panel.plan is None and panel.comparison_source == chosen
+    assert panel.text.get('1.0', 'end-1c') == ''
+    assert 'https://example.org/' in panel.preview_box.get('1.0', 'end-1c')
+    def editor(parent, saved, initial, *, locked_queries):
+        assert locked_queries is True
+        changed = values(dimensions='材质')
+        saved(build_goal(changed), changed)
+    monkeypatch.setattr(comparison_panel, 'open_editor', editor)
+    panel.configure_comparison()
+    assert panel.comparison_goal['comparison']['dimensions'] == ['材质']
+    assert panel.comparison_source['manifest'] == chosen['manifest']
+
+
+def test_source_preview_uses_worker_and_copied_scope(panel, monkeypatch):
+    from agent_service import comparison_history
+    panel.comparison_source = selection()
+    panel.comparison_goal = build_goal(values())
+    panel.session = object()
+    calls = []
+    monkeypatch.setattr(panel, 'start', lambda kind, operation: calls.append((kind, operation)))
+    monkeypatch.setattr(computer_agent, 'prepare', lambda *a: pytest.fail('wrong preview'))
+    captured = []
+    monkeypatch.setattr(comparison_history, 'prepare_selected',
+                        lambda *args, **kw: captured.append(args))
+    panel.preview()
+    assert calls[0][0] == 'comparison_preview'
+    panel.comparison_goal['title'] = 'changed later'
+    calls[0][1](panel.session)
+    assert captured[0][1:3] == ('办公键盘对比', build_goal(values()))
+
+
+def test_changed_queries_are_rejected_by_saved_callback(panel, monkeypatch):
+    from agent_service import comparison_panel
+    panel.comparison_source = selection()
+    panel.comparison_goal = build_goal(values())
+    def editor(parent, saved, initial, **kw):
+        with pytest.raises(ValueError, match='检索主题不能改变'):
+            saved(build_goal(values(query1='different')), values(query1='different'))
+    monkeypatch.setattr(comparison_panel, 'open_editor', editor)
+    panel.configure_comparison()
+    assert panel.comparison_goal == build_goal(values())
+
+
+def test_recovery_cannot_silently_become_fresh_comparison(panel, tmp_path, monkeypatch):
+    from agent_service import comparison_panel
+    from agent_service.computer import ComputerSession
+    session = ComputerSession.create(tmp_path / 'sessions')
+    plan = computer_agent.prepare(session, '恢复范围', build_goal(values()))
+    panel.comparison_source = selection()
+    panel.messages.put(('recovery_preview', {'session_root': str(session.root),
+                        'plan': plan, 'reason': '继续剩余步骤'}, None))
+    panel.poll()
+    assert panel.comparison_source is None and panel.comparison_recovery
+    monkeypatch.setattr(comparison_panel, 'open_editor', lambda *a: pytest.fail('immutable recovery'))
+    panel.configure_comparison()
+    panel.preview()
+    assert panel.plan == plan
+    panel.reset_comparison_source()
+    assert panel.plan is None and panel.comparison_goal is None and not panel.comparison_recovery
+
+
+@pytest.mark.parametrize('kind', ['comparison_source', 'comparison_preview'])
+def test_stopped_worker_cannot_restore_approval(panel, kind):
+    panel.stop()
+    panel.messages.put((kind, selection(), None))
+    panel.poll()
+    assert panel.plan is None and panel.comparison_source is None
+    assert str(panel.execute_button['state']) == 'disabled'
+
+
+def test_source_controls_busy_and_mode_gated(panel):
+    assert str(panel.comparison_source_button['state']) == 'normal'
+    panel.set_busy(True)
+    assert str(panel.comparison_source_button['state']) == 'disabled'
+    panel.set_busy(False)
+    panel.mode.set(ui.MODES[9])
+    panel.mode_changed()
+    assert str(panel.comparison_source_button['state']) == 'disabled'
+
+
+def test_invalid_history_clears_source_without_fallback(panel):
+    panel.comparison_source = selection()
+    panel.comparison_goal = build_goal(values())
+    panel.messages.put(('comparison_preview', None, 'comparison_seed_changed'))
+    panel.poll()
+    assert panel.plan is None and panel.comparison_source is None
+    assert panel.comparison_goal is None and '另选来源' in panel.status.get()

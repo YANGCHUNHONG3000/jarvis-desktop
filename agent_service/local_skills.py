@@ -27,8 +27,12 @@ _CODE = ("local_skills.py", "office.py", "office_host.py", "office_workflow.py",
          "office_source.py", "office_source_plan.py", "artifact_source.py",
          "task_history.py", "email_draft.py", "mail_export.py", "office_resume.py",
          "assistant.py", "skill_matching.py", "skill_resume.py", "gap_recovery.py",
-         "source_intake.py", "workbook_source.py", "workbook_source_host.py", "workbook_plan.py",
-         "edited_artifact_source.py", "office_edit.py", "office_edit_host.py")
+         "adapter_development.py",
+         "source_intake.py", "external_document_source.py", "external_document_source_host.py",
+         "workbook_source.py", "workbook_source_host.py", "workbook_plan.py",
+         "edited_artifact_source.py", "generated_edit_table.py", "verified_edit_document.py",
+         "verified_edit_workbook.py", "structured_document_source.py", "office_edit.py", "office_edit_host.py",
+         "computer.py", "computer_agent_tools.py")
 
 
 class SkillError(ValueError):
@@ -53,7 +57,8 @@ def validate_manifest(value):
             or type(value["name"]) is not str or not 1 <= len(value["name"].strip()) <= 80
             or any(ord(c) < 32 or 0xD800 <= ord(c) <= 0xDFFF for c in value["name"])
             or value["recipe"] not in ("table_report", "table_copy", "document_copy", "document_table_report",
-                                       "document_numeric_report")
+                                       "document_numeric_report", "document_table_transcription",
+                                       "workbook_audit_report", "document_structure_report")
             or type(value["draft"]) is not bool):
         raise SkillError("skill_manifest_invalid")
     columns = value["sum_columns"]
@@ -62,7 +67,7 @@ def validate_manifest(value):
             or len(set(columns)) != len(columns)
             or value["recipe"] not in {"table_report", "document_numeric_report"} and columns
             or value["recipe"] == "document_numeric_report" and (not columns or 0 in columns)
-            or value["recipe"] == "table_copy" and value["draft"]):
+            or value["recipe"] in {"table_copy", "document_table_transcription"} and value["draft"]):
         raise SkillError("skill_columns_invalid")
     return json.loads(json.dumps(value, ensure_ascii=False))
 
@@ -70,6 +75,8 @@ def validate_manifest(value):
 def build_steps(manifest, snapshot):
     candidate = validate_manifest(manifest)
     title = candidate["name"]
+    if candidate["recipe"] in {"workbook_audit_report", "document_structure_report"}:
+        return _audit_steps(candidate, snapshot)
     if candidate["recipe"] in {"table_report", "table_copy"}:
         if snapshot.get("kind") != "table":
             raise SkillError("skill_source_kind_mismatch")
@@ -79,7 +86,8 @@ def build_steps(manifest, snapshot):
                   "sum_columns": candidate["sum_columns"]}]
         if candidate["recipe"] == "table_report":
             steps.append({"id": "s2", "action": "report_from_sheet", "from": "s1", "title": title + " · 汇总"})
-    elif candidate["recipe"] in {"document_table_report", "document_numeric_report"}:
+    elif candidate["recipe"] in {"document_table_report", "document_numeric_report",
+                               "document_table_transcription"}:
         if snapshot.get("kind") != "document" or "table" not in snapshot.get("observed", {}):
             raise SkillError("skill_document_table_required")
         width = len(snapshot["observed"]["table"]["headers"])
@@ -89,8 +97,10 @@ def build_steps(manifest, snapshot):
             first["action"] = "spreadsheet_from_document_table_numeric"
             first["numeric_columns"] = candidate["sum_columns"][:]
             first["sum_columns"] = candidate["sum_columns"][:]
+        report_title = title if candidate["recipe"] == "document_table_transcription" else (
+            title if title.endswith("报告") else title + " · 报告")
         steps = [first, {"id": "s2", "action": "report_from_sheet", "from": "s1",
-                         "title": title + " · 报告"}]
+                         "title": report_title}]
     else:
         if snapshot.get("kind") != "document":
             raise SkillError("skill_source_kind_mismatch")
@@ -101,6 +111,60 @@ def build_steps(manifest, snapshot):
                       "data": {"subject": title, "body": "附件为本次整理的文档。此邮件尚未发送。", "to": []},
                       "attachments": attachments})
     return resolve_source_steps(steps, snapshot)
+
+
+def _workbook_audit_table(snapshot):
+    from openpyxl.utils.cell import get_column_letter
+    from .workbook_source import validate_snapshot
+
+    checked = validate_snapshot(snapshot)
+    rows = []
+    for sheet in checked["observed"]["sheets"]:
+        formulas = {entry["cell"]: entry for entry in sheet["formulas"]}
+        for row_index, values in enumerate(sheet["values"], 1):
+            for column_index, value in enumerate(values, 1):
+                address = f"{get_column_letter(column_index)}{row_index}"
+                formula = formulas.get(address)
+                if formula is not None:
+                    kind, literal, expression = "公式", None, formula["expression"]
+                    if value != formula["result"]:
+                        raise SkillError("skill_formula_result_changed")
+                else:
+                    kind = ("空白" if value is None else "布尔" if type(value) is bool
+                            else "数字" if type(value) in (int, float) else "文本")
+                    literal, expression = value, ""
+                rows.append([sheet["name"], sheet["state"], address, kind,
+                             literal, expression, value])
+                if len(rows) > 200:
+                    raise SkillError("skill_audit_output_row_limit")
+    return {"headers": ["工作表", "状态", "单元格", "类型", "字面值", "公式表达式", "核验值"],
+            "rows": rows}
+
+
+def _audit_steps(candidate, snapshot):
+    recipe, title = candidate["recipe"], candidate["name"]
+    if candidate["draft"] or candidate["sum_columns"]:
+        raise SkillError("skill_audit_effect_invalid")
+    if recipe == "workbook_audit_report":
+        if snapshot.get("kind") != "workbook":
+            raise SkillError("skill_source_kind_mismatch")
+        table = _workbook_audit_table(snapshot)
+        note = ("逐格审计所选工作簿的全部受支持工作表与范围，包括隐藏工作表和空白单元格。"
+                "公式表达式与经原生重算且独立核验的结果分列记录。此为静态审计副本，不保留可执行公式或原工作簿布局。")
+    else:
+        if snapshot.get("kind") != "document_structure":
+            raise SkillError("skill_source_kind_mismatch")
+        from .structured_document_source import audit_table
+        table = audit_table(snapshot["observed"])
+        note = ("按来源主文档实际顺序审计全部段落、表格和实体单元格，包括空白、合并与嵌套结构。"
+                "结构字段记录位置和关系；此为静态审计副本，不重建来源文档的页面布局或样式。")
+    steps = [
+        {"id": "s1", "action": "spreadsheet", "data": {"kind": "spreadsheet",
+            "title": title, "headers": table["headers"], "rows": table["rows"], "sum_columns": []}},
+        {"id": "s2", "action": "document_from_sheet", "from": "s1",
+         "title": title, "paragraphs": [note]},
+    ]
+    return workflow.validate_steps(steps)
 
 
 def _store(path, create=False):
@@ -161,7 +225,7 @@ def _fixture(candidate):
         snapshot.update(kind="table", display_name="合成验收.csv",
                         observed={"headers": ["列" + str(i + 1) for i in range(width)],
                                   "rows": [[3] * width, [5] * width]})
-    elif candidate["recipe"] == "document_table_report":
+    elif candidate["recipe"] in {"document_table_report", "document_table_transcription"}:
         snapshot["observed"]["table"] = {
             "headers": ["编号", "数量"],
             "rows": [["001", "3.0"], ["=1+1", "5.0"], ["合计", "8.0"], [" 原文 ", ""]]}
@@ -172,6 +236,27 @@ def _fixture(candidate):
             "headers": headers,
             "rows": [["001", *["3.0"] * (width - 1)],
                      ["=1+1", *["5.0"] * (width - 1)]]}
+    elif candidate["recipe"] == "workbook_audit_report":
+        from .workbook_source import _coverage
+        sheets = [
+            {"name": "甲", "range": "A1:B1", "state": "visible", "values": [[2, 4]],
+             "formulas": [{"cell": "B1", "expression": "=A1*2", "result": 4}]},
+            {"name": "乙", "range": "A1:B1", "state": "hidden", "values": [[None, "=A1"]],
+             "formulas": []},
+        ]
+        snapshot.update(kind="workbook", display_name="合成验收.xlsx", bytes=100,
+                        coverage=_coverage(sheets), observed={"sheets": sheets},
+                        native_sha256="b" * 64)
+    elif candidate["recipe"] == "document_structure_report":
+        snapshot.update(kind="document_structure", observed={"records": [
+            {"position": "body/0", "type": "paragraph",
+             "structure": {"parent": "body", "paragraph_index": 0}, "text": "合成正文"},
+            {"position": "body/1", "type": "table",
+             "structure": {"width": 1, "rows": 1, "depth": 0, "table_index": 0}, "text": ""},
+            {"position": "body/1/row/0/cell/0", "type": "cell",
+             "structure": {"row": 0, "cell": 0, "column": 0, "span": 1,
+                           "merge": "none"}, "text": "单元格"},
+        ]})
     return snapshot
 
 
@@ -189,12 +274,17 @@ def verify_offline(store, skill_id, digest):
             raise SkillError("skill_data_changed")
         if candidate["recipe"] == "table_copy" and (len(steps) != 1 or steps[0]["data"]["sum_columns"]):
             raise SkillError("skill_data_changed")
-        if candidate["recipe"] == "document_table_report":
+        if candidate["recipe"] in {"document_table_report", "document_table_transcription"}:
             table = fixture["observed"]["table"]
             sheet = steps[0]["data"]
             if (sheet["rows"] != table["rows"] or sheet["headers"] != table["headers"]
                     or sheet["sum_columns"]):
                 raise SkillError("skill_data_changed")
+            if candidate["recipe"] == "document_table_transcription" and (
+                    steps[1]["title"] != candidate["name"]
+                    or "仅提取来源文档的表格" not in steps[1]["paragraphs"][-1]
+                    or "未重新计算" not in steps[1]["paragraphs"][-1]):
+                raise SkillError("skill_report_changed")
         if candidate["recipe"] == "document_numeric_report":
             from .office import _expected
             table = fixture["observed"]["table"]
@@ -206,6 +296,23 @@ def verify_offline(store, skill_id, digest):
                     or any(type(row[column]) not in (int, float) for row in sheet["rows"]
                            for column in candidate["sum_columns"])
                     or "重新求和" not in steps[1]["paragraphs"][-1]):
+                raise SkillError("skill_data_changed")
+        if candidate["recipe"] in {"workbook_audit_report", "document_structure_report"}:
+            if candidate["recipe"] == "workbook_audit_report":
+                expected = _workbook_audit_table(fixture)
+                if (len(steps[0]["data"]["rows"]) != 4
+                        or steps[0]["data"]["rows"][1][5] != "=A1*2"
+                        or steps[0]["data"]["rows"][2][3] != "空白"
+                        or steps[0]["data"]["rows"][3][3] != "文本"):
+                    raise SkillError("skill_data_changed")
+            else:
+                from .structured_document_source import audit_table
+                expected = audit_table(fixture["observed"])
+            if (steps[0]["data"]["headers"] != expected["headers"]
+                    or steps[0]["data"]["rows"] != expected["rows"]
+                    or steps[0]["data"]["sum_columns"]
+                    or len(steps) != 2 or steps[1]["action"] != "document_from_sheet"
+                    or steps[1]["from"] != "s1" or steps[1]["title"] != candidate["name"]):
                 raise SkillError("skill_data_changed")
         wrong = dict(fixture, kind="table" if fixture["kind"] == "document" else "document")
         try:
@@ -265,7 +372,33 @@ def _state(root, skill_id):
 def _live_check(path, digest, base):
     record = _gate_file(path, "live.json", digest)
     root = history._task(record.get("task_root"), history._base(base))
+    from . import adapter_development
+    store = path.parent.parent
+    trial_binding = adapter_development.external_trial_binding(root, base, store)
+    activated = adapter_development.activated_external_trial(
+        store, path.parent.name, digest, base)
+    if activated is not None:
+        if activated[0] != str(root) or (trial_binding is not None and
+                                          trial_binding != activated[1]):
+            raise SkillError("skill_live_source_changed")
+        trial_binding = activated[1]
+    if trial_binding is not None:
+        request = workflow._read_json(root / "skill-request.json")
+        if (record.get("source_retry") != trial_binding or
+                request.get("source_retry") != trial_binding):
+            raise SkillError("skill_live_source_changed")
+        from .gap_recovery import verify_prepared_origin
+        verify_prepared_origin(root, base)
     _verify_success(root, base, digest, record.get("task_result_sha256"))
+    pointer = root / "skill-resume-latest.json"
+    if record.get("continuation_sha256") is not None:
+        if (type(record["continuation_sha256"]) is not str
+                or not _HASH.fullmatch(record["continuation_sha256"])
+                or _linked(pointer) or not pointer.is_file()
+                or sha256(pointer.read_bytes()).hexdigest() != record["continuation_sha256"]):
+            raise SkillError("skill_live_continuation_changed")
+    elif workflow._read_json(root / "result.json").get("state") != "succeeded":
+        raise SkillError("skill_live_continuation_missing")
     return record
 
 
@@ -278,18 +411,41 @@ def _verify_success(root, base, digest, expected_result_hash=None):
     if expected_result_hash is not None and sha256(result_path.read_bytes()).hexdigest() != expected_result_hash:
         raise SkillError("skill_live_result_changed")
     info = result.get("skill", {})
-    if (result.get("ok") is not True or result.get("state") != "succeeded"
+    if (result.get("state") not in {"succeeded", "cancelled"}
+            or result.get("ok") is not (result.get("state") == "succeeded")
             or info.get("sha256") != digest or info.get("implementation_sha256") != implementation_sha256()
             or info.get("mode") not in {"trial", "active"}):
         raise SkillError("skill_live_result_invalid")
     inspected = history.inspect_task(root, base)
-    if inspected["state"] != "succeeded" or not inspected["artifacts"]:
+    resumed = result["state"] == "cancelled"
+    if resumed:
+        from .skill_resume import latest_continuation
+        continuation = latest_continuation(root, base)
+        if (type(continuation) is not dict or continuation.get("state") != "succeeded"
+                or inspected.get("continuation", {}).get("state") != "succeeded"
+                or inspected.get("continuation", {}).get("kind") != "skill_resume"):
+            raise SkillError("skill_live_continuation_unverified")
+    elif inspected["state"] != "succeeded":
+        raise SkillError("skill_live_receipts_invalid")
+    if not inspected["artifacts"]:
         raise SkillError("skill_live_receipts_invalid")
     workflow_root = Path(inspected["workflow_root"])
     manifest = workflow._read_json(workflow_root / "manifest.json")
     request = workflow._read_json(root / "skill-request.json")
+    source_binding = request.get("source_retry")
+    if source_binding is not None:
+        origin_record = workflow._read_json(root / "retry-origin.json")
+        if (type(source_binding) is not dict or
+                set(source_binding) != {"task_root", "token"} or
+                origin_record.get("task_root") != source_binding["task_root"] or
+                origin_record.get("token") != source_binding["token"]):
+            raise SkillError("skill_live_source_changed")
     candidate = validate_manifest(request.get("manifest"))
     snapshot = workflow._read_json(root / "sources" / "source.json")
+    origin = root / "retry-origin.json"
+    if source_binding is not None or origin.exists() or _linked(origin):
+        from .gap_recovery import verify_prepared_origin
+        verify_prepared_origin(root, base)
     if (workflow._hash(candidate) != digest or candidate["id"] != info.get("id")
             or request.get("sha256") != digest or request.get("mode") != info.get("mode")
             or request.get("executor") != "supervised_office"
@@ -302,6 +458,10 @@ def _verify_success(root, base, digest, expected_result_hash=None):
     if (len(source_files) != 1 or _linked(source_files[0]) or not source_files[0].is_file()
             or source_files[0].stat().st_size > 20_000_000
             or sha256(source_files[0].read_bytes()).hexdigest() != snapshot["sha256"]):
+        raise SkillError("skill_live_source_changed")
+    # Re-derive provenance as well as checking the copied bytes. An edited
+    # Office source also depends on its ancestor plans, receipts, and files.
+    if _prepared_snapshot(root, snapshot, base) != snapshot:
         raise SkillError("skill_live_source_changed")
     receipts, unknown = workflow._resume_preflight(manifest["steps"], workflow_root)
     if unknown or len(receipts) != len(manifest["steps"]):
@@ -339,6 +499,13 @@ def record_live(store, skill_id, digest, task_root, base):
         result = {"schema": 1, "candidate_sha256": digest, "implementation_sha256": implementation_sha256(),
                   "passed": True, "kind": "live_office", "task_root": str(task),
                   "task_result_sha256": sha256((task / "result.json").read_bytes()).hexdigest()}
+        if request.get("source_retry") is not None:
+            result["source_retry"] = request["source_retry"]
+        if workflow._read_json(task / "result.json").get("state") == "cancelled":
+            pointer = task / "skill-resume-latest.json"
+            if _linked(pointer) or not pointer.is_file():
+                raise SkillError("skill_live_continuation_unverified")
+            result["continuation_sha256"] = sha256(pointer.read_bytes()).hexdigest()
         _record(path / "live.json", result)
         return result
 
@@ -375,6 +542,16 @@ def status(store, skill_id, base=None):
             for name in ("offline.json", "review.json"):
                 _gate_file(path, name, state["active"])
             _live_check(path, state["active"], base or Path(__file__).resolve().parents[1] / "data" / "assistant_tasks")
+            token_path = root / skill_id / "development-activation.json"
+            if _linked(token_path):
+                enabled = False
+            elif token_path.exists():
+                token = workflow._read_json(token_path)
+                if (token.get("schema") != 1 or token.get("candidate_sha256") != state["active"]
+                        or token.get("implementation_sha256") != implementation_sha256()
+                        or type(token.get("nonce")) is not str
+                        or not re.fullmatch(r"[0-9a-f]{32}", token["nonce"])):
+                    enabled = False
         except (ValueError, OSError):
             enabled = False
     return dict(state, enabled=enabled)
@@ -476,17 +653,38 @@ def _prepared_snapshot(task, supplied, base):
     if provenance.exists() or _linked(provenance):
         from . import artifact_source
         value = workflow._read_json(provenance)
-        if (set(value) != {"kind", *artifact_source._FIELDS}
-                or value.get("kind") != "verified_generated_office_artifact"):
-            raise SkillError("skill_source_invalid")
-        ref = {key: value.get(key) for key in artifact_source._FIELDS}
-        artifact_source._reference(ref)
-        current, original, receipt, index = artifact_source._verified(ref["artifact"], ref["sha256"], base)
-        if current != ref:
-            raise SkillError("skill_source_changed")
-        kind, observed, coverage = artifact_source._extract(original, receipt, index, source)
+        if type(value) is dict and value.get("kind") == "verified_generated_edited_table":
+            from .generated_edit_table import verify_snapshot
+            kind, observed, coverage = verify_snapshot(task, snapshot, value, base)
+        elif type(value) is dict and value.get("kind") == "verified_edited_document":
+            from .verified_edit_document import verify_snapshot
+            kind, observed, coverage = verify_snapshot(task, snapshot, value, base)
+        elif type(value) is dict and value.get("kind") == "verified_edited_workbook":
+            from .verified_edit_workbook import verify_snapshot
+            kind, observed, coverage = verify_snapshot(task, snapshot, value, base)
+        else:
+            if (set(value) != {"kind", *artifact_source._FIELDS}
+                    or value.get("kind") != "verified_generated_office_artifact"):
+                raise SkillError("skill_source_invalid")
+            ref = {key: value.get(key) for key in artifact_source._FIELDS}
+            artifact_source._reference(ref)
+            current, original, receipt, index = artifact_source._verified(ref["artifact"], ref["sha256"], base)
+            if current != ref:
+                raise SkillError("skill_source_changed")
+            kind, observed, coverage = artifact_source._extract(original, receipt, index, source)
     else:
-        if source.suffix == ".csv":
+        if (snapshot.get("kind") == "document_structure" and source.suffix == ".docx"
+                and snapshot.get("coverage", {}).get("scope") == "verified_external_document_structure"):
+            from .external_document_source import verify_external_document
+            if verify_external_document(task) != snapshot:
+                raise SkillError("skill_source_changed")
+            kind, observed, coverage = snapshot["kind"], snapshot["observed"], snapshot["coverage"]
+        elif snapshot.get("kind") == "workbook" and source.suffix == ".xlsx":
+            from .workbook_source import verify_workbook_source
+            if verify_workbook_source(task) != snapshot:
+                raise SkillError("skill_source_changed")
+            kind, observed, coverage = snapshot["kind"], snapshot["observed"], snapshot["coverage"]
+        elif source.suffix == ".csv":
             observed, coverage = office_source._csv(source)
             kind = "table"
         else:
@@ -503,7 +701,13 @@ def _prepared_snapshot(task, supplied, base):
             or Path(snapshot["display_name"]).name != snapshot["display_name"]
             or not snapshot["display_name"].casefold().endswith(source.suffix)):
         raise SkillError("skill_source_changed")
-    office_source._writer_compatible(snapshot["display_name"], kind, observed)
+    if kind in {"table", "document"}:
+        office_source._writer_compatible(snapshot["display_name"], kind, observed)
+    elif kind == "document_structure":
+        from .structured_document_source import audit_table
+        audit_table(observed)
+    elif kind != "workbook":
+        raise SkillError("skill_source_kind_mismatch")
     return snapshot
 
 
@@ -525,17 +729,34 @@ def _publish_checked(task, result, publish):
 
 
 def _run_claimed(root, skill_id, state, mode, digest, candidate, task, base, deadline,
-                 execute, publish, make_snapshot):
+                 execute, publish, make_snapshot, pause_after_step=None, source_retry=None):
     cancel = task / "cancel.flag"
     implementation = implementation_sha256()
+    development_nonce = None
+    token_path = root / skill_id / "development-activation.json"
+    if mode == "active" and _linked(token_path):
+        raise SkillError("skill_development_token_invalid")
+    if mode == "active" and token_path.exists():
+        token = workflow._read_json(token_path)
+        nonce = token.get("nonce")
+        if (token.get("schema") != 1 or token.get("candidate_sha256") != digest
+                or type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{32}", nonce)
+                or token.get("implementation_sha256") != implementation):
+            raise SkillError("skill_development_token_invalid")
+        development_nonce = nonce
     workflow_root = task / ("workflow-" + uuid.uuid4().hex)
     request = {"manifest": candidate, "sha256": digest, "implementation_sha256": implementation,
                "mode": mode, "executor": "supervised_office" if execute is None else "injected_test",
                "workflow_root": str(workflow_root)}
+    if source_retry is not None:
+        request["source_retry"] = source_retry
     workflow._write_new(task / "skill-request.json", request)
     try:
         snapshot = make_snapshot()
         steps = build_steps(candidate, snapshot)
+        if pause_after_step is not None and (mode != "trial" or pause_after_step not in
+                [step["id"] for step in steps[:-1]]):
+            raise SkillError("skill_pause_step_invalid")
         if cancel.exists() or time.monotonic() >= deadline:
             raise SkillError("skill_cancelled_before_effect")
     except (ValueError, TypeError, KeyError, OSError) as exc:
@@ -554,8 +775,12 @@ def _run_claimed(root, skill_id, state, mode, digest, candidate, task, base, dea
     run = None
     error = None
     try:
+        def cancel_requested():
+            if pause_after_step is not None and (workflow_root / pause_after_step / "receipt.json").is_file():
+                cancel.touch(exist_ok=True)
+            return cancel.exists()
         run = workflow.run_office_workflow(steps, workflow_root, execute=execute, deadline=deadline,
-                                          cancel_requested=lambda: cancel.exists())
+                                          cancel_requested=cancel_requested)
     except Exception:
         error = "skill_effect_unknown"
     receipts = {}
@@ -586,23 +811,41 @@ def _run_claimed(root, skill_id, state, mode, digest, candidate, task, base, dea
             state["active"] = None
             state["remaining_runs"] = 0
         _record(root / skill_id / "active.json", state)
-        if (outcome == "cancelled" and execute is None and 0 < len(receipts) < len(steps)):
-            # A permit is published only after the original parent result and
-            # blocked candidate state are durable. Failure leaves cancellation
-            # intact and simply makes this task ineligible for continuation.
+        if result["ok"] and development_nonce is not None:
             try:
-                from .skill_resume import mint_permit
-                mint_permit(task, base, root)
-            except Exception:
+                runs = root / skill_id / "active-runs"
+                if _linked(runs):
+                    raise SkillError("skill_run_record_invalid")
+                runs.mkdir(exist_ok=True)
+                workflow._write_new(runs / (task.name + ".json"),
+                    {"schema": 1, "task_root": str(task), "candidate_sha256": digest,
+                     "implementation_sha256": implementation,
+                     "nonce": development_nonce,
+                     "result_sha256": sha256((task / "result.json").read_bytes()).hexdigest()})
+            except (ValueError, OSError):
+                # The effect remains successful. Missing provenance only blocks
+                # later expansion; it must not rewrite a verified task result.
                 pass
+    if outcome == "cancelled" and execute is None and 0 < len(receipts) < len(steps):
+        # A permit is published after the parent result, and for active mode
+        # after the disabled candidate state, are durable. Trial permits bind
+        # the same prefix without granting active runs.
+        try:
+            from .skill_resume import mint_permit
+            mint_permit(task, base, root)
+        except Exception:
+            pass
     return published
 
 
 def run_skill(store, skill_id, task_root, base, *, source_file=None,
-              source_artifact=None, trial_digest=None, expected_digest=None,
-              execute=None, deadline=None):
-    if (source_file is None) == (source_artifact is None):
+              source_artifact=None, source_retry=None, source_instruction=None,
+              trial_digest=None, expected_digest=None,
+              execute=None, deadline=None, pause_after_step=None):
+    if sum(value is not None for value in (source_file, source_artifact, source_retry)) != 1:
         raise SkillError("skill_requires_one_source")
+    if source_retry is not None and (type(source_instruction) is not str or not source_instruction):
+        raise SkillError("skill_source_instruction_invalid")
     deadline = _deadline(deadline)
     root = _store(store)
     with workflow._owner(root):
@@ -617,14 +860,34 @@ def run_skill(store, skill_id, task_root, base, *, source_file=None,
             raise SkillError("skill_cancelled_before_start")
         with workflow._owner(task):
             def make_snapshot():
+                if source_retry is not None:
+                    from .gap_recovery import snapshot_retry_source
+                    request = task / "request.txt"
+                    data = source_instruction.encode("utf-8")
+                    if not 0 < len(data) <= 48_000 or _linked(request) or request.exists():
+                        raise SkillError("skill_source_instruction_invalid")
+                    with request.open("xb") as output:
+                        output.write(data)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    snapshot = snapshot_retry_source(source_retry, task, base, source_instruction)
+                    from .gap_recovery import verify_prepared_origin
+                    verify_prepared_origin(task, base)
+                    return snapshot
                 if source_artifact is not None:
                     from .artifact_source import snapshot_artifact_source
-                    return snapshot_artifact_source(source_artifact, task, base)
+                    return snapshot_artifact_source(
+                        source_artifact, task, base,
+                        full_workbook=candidate["recipe"] == "workbook_audit_report")
                 from .artifact_source import require_external_source_file
-                return snapshot_source(require_external_source_file(source_file, base), task)
+                external = require_external_source_file(source_file, base)
+                from .source_intake import snapshot_selected_source
+                return snapshot_selected_source(external, task,
+                    stop=lambda: cancel.exists(), deadline=deadline)
             return _run_claimed(root, skill_id, state, mode, digest, candidate, task, base,
                                 deadline, execute, lambda result: _publish_parent(task, result),
-                                make_snapshot)
+                                make_snapshot, pause_after_step=pause_after_step,
+                                source_retry=source_retry)
 
 
 def run_prepared_skill(store, skill_id, task_root, base, *, snapshot, expected_digest,
@@ -637,18 +900,22 @@ def run_prepared_skill(store, skill_id, task_root, base, *, snapshot, expected_d
     with workflow._owner(root):
         state, mode, digest, candidate = _selected(root, skill_id, base, None, expected_digest)
         task = _prepare_task(task_root, base)
-        permitted = {"events.jsonl", "request.txt", "sources", "cancel.flag"}
+        permitted = {"events.jsonl", "request.txt", "sources", "cancel.flag", "retry-origin.json"}
         if any(item.name not in permitted for item in task.iterdir()):
             raise SkillError("skill_task_replay_blocked")
         events = task / "events.jsonl"
         if _linked(events) or not events.is_file() or _linked(task / "sources"):
             raise SkillError("skill_task_invalid")
+        origin = task / "retry-origin.json"
         cancel = task / "cancel.flag"
         if _linked(cancel) or cancel.exists() and not cancel.is_file():
             raise SkillError("skill_task_invalid")
         if cancel.exists() or time.monotonic() >= deadline:
             raise SkillError("skill_cancelled_before_start")
         with workflow._owner(task):
+            if origin.exists() or _linked(origin):
+                from .gap_recovery import verify_prepared_origin
+                verify_prepared_origin(task, base)
             return _run_claimed(root, skill_id, state, mode, digest, candidate, task, base,
                                 deadline, None, publish,
                                 lambda: _prepared_snapshot(task, snapshot, base))

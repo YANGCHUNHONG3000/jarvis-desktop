@@ -27,8 +27,10 @@ _EVENTS = {"started", "source_snapshot_requested", "source_snapshot_verified",
            "skills_discovered", "model_requested", "model_returned", "model_failed",
            "model_schema_rejected", "schema_repair_requested", "skill_recovery_requested",
            "plan_accepted", "capability_gap_recorded", "capability_gap_record_failed", "result",
-           "gap_retry_snapshot_requested", "gap_retry_snapshot_verified"}
-_SOURCE_NAMES = {"source.json", "provenance.json", "source.csv", "source.xlsx", "source.docx"}
+           "gap_retry_snapshot_requested", "gap_retry_snapshot_verified",
+           "fixed_workbook_audit_required"}
+_SOURCE_NAMES = {"source.json", "source-native.json", "native-request.json", "provenance.json",
+                 "source.csv", "source.xlsx", "source.docx"}
 
 
 class GapRetryError(ValueError):
@@ -146,8 +148,9 @@ def _source(task, base, result):
         return None, None, {}
     if type(source_info) is not dict or task_history._linked(sources) or not sources.is_dir():
         _fail("gap_source_invalid")
-    entries = list(islice(sources.iterdir(), 6))
-    if (not entries or any(item.name not in _SOURCE_NAMES or task_history._linked(item)
+    entries = list(islice(sources.iterdir(), 7))
+    if (not entries or len(entries) > 6
+            or any(item.name not in _SOURCE_NAMES or task_history._linked(item)
                            or not item.is_file() for item in entries)):
         _fail("gap_source_invalid")
     names = {item.name for item in entries}
@@ -359,3 +362,27 @@ def snapshot_retry_source(ref, new_task, base, instruction):
               "source_files": proof["source_files"]}
     office_source._write_json_new(task / "retry-origin.json", origin)
     return snapshot
+
+
+def verify_prepared_origin(task, base):
+    """Recheck a copied gap source's exact parent and file bytes before a skill runs."""
+    task = task_history._task(task, task_history._base(base))
+    origin = _json(task / "retry-origin.json")
+    expected = origin.get("instruction_sha256")
+    if type(expected) is not str or not _HASH.fullmatch(expected):
+        _fail("gap_origin_invalid")
+    _instruction(task, task.parent, expected)
+    sources = task / "sources"
+    if task_history._linked(sources) or not sources.is_dir():
+        _fail("gap_source_invalid")
+    entries = list(islice(sources.iterdir(), 7))
+    if (not entries or len(entries) > 6
+            or any(item.name not in _SOURCE_NAMES or task_history._linked(item)
+                   or not item.is_file() for item in entries)):
+        _fail("gap_source_invalid")
+    files = {item.name: sha256(_read(item, 20_000_000 if item.name.startswith("source.")
+                                       and item.name != "source.json" else 100_000)).hexdigest()
+             for item in entries}
+    if _origin(task, task.parent, expected, files, 0, frozenset()) is None:
+        _fail("gap_origin_invalid")
+    return True

@@ -56,7 +56,13 @@ REVIEW_SYSTEM_V4 = (
     'For a compound dimension, the selected quote itself must cover EVERY component. '
     'A word-processor-only quote is insufficient for document AND spreadsheet editing, '
     'even if unselected text elsewhere describes spreadsheets; mark it uncertain. '
-    'Inspect each page for attribution. Publisher is null or {"name":"literal name",'
+    'Inspect EVERY supplied page for attribution independently of its selected '
+    'dimension quotes. A page with null or irrelevant spans can still supply essential '
+    'publisher evidence. Search its full supplied text, including footer/About text: '
+    '"is a project of" a named organization, "is owned by" a named company, and '
+    'a service agreement with a named operator are explicit attribution. Do not '
+    'discard these statements just because they do not describe file formats. '
+    'Publisher is null or {"name":"literal name",'
     '"quote":"unique contiguous exact source substring"}; name <=80, quote <=240 '
     'characters, name must occur in quote. A meaningful self-attributed publication '
     'project can name itself: a Wiki contribution/license statement naming that Wiki '
@@ -148,8 +154,13 @@ def build_review_context(context, validated_selection):
               'selection': {'sources': [deepcopy(selected[i]) for i in ids]}}
     # Legacy review context hashes deliberately exclude the goal. V4 carries
     # version/goal authority so six-page and 8000-character inputs validate.
-    if context.get('goal', {}).get('comparison', {}).get('evidence_version') == 4:
+    from .publisher_evidence import enabled
+    if context.get('goal', {}).get('comparison', {}).get('evidence_version') == 4 or enabled(context.get('goal', {})):
         result['goal'] = deepcopy(context['goal'])
+    from .publisher_roles import enabled as role_policy, candidates
+    if role_policy(context.get('goal', {})):
+        for source in result['sources']:
+            source['project_role_candidates'] = candidates(source)
     return result
 
 
@@ -174,6 +185,9 @@ def assess(context, validated_selection, review):
         _fail()
     v3 = context.get('goal', {}).get('comparison', {}).get('evidence_version') in {3,4}
     checked, publishers, cells, publisher_evidence = {}, {}, {}, {}
+    from .publisher_roles import enabled as role_policy, role, compatible
+    roles_enabled = role_policy(context.get('goal', {}))
+    publisher_roles = {}
     relevant = 0
     for entry in review['sources']:
         if (type(entry) is not dict or set(entry) != {'id', 'publisher', 'cells'}
@@ -200,9 +214,15 @@ def assess(context, validated_selection, review):
                       'bare_name' if publisher['quote'].strip() == publisher['name'].strip() else
                       'navigation' if _navigation_only(publisher) else
                       'download_label' if publisher['quote'].strip().casefold().startswith('download free ') else 'supported')
+            from .publisher_evidence import enabled, attribution_status
+            if status == 'supported' and enabled(context.get('goal', {})):
+                status = attribution_status(sources[ids.index(sid)], publisher,
+                    policy=context.get('goal', {}).get('comparison', {}).get('publisher_policy'))
             publisher_evidence[sid] = status
             publishers[sid] = (' '.join(publisher['name'].split()).casefold()
                                if not v3 or status == 'supported' else None)
+            if roles_enabled and status == 'supported':
+                publisher_roles[sid] = role(sources[ids.index(sid)], publisher)
         else:
             publishers[sid] = None
             publisher_evidence[sid] = 'unknown'
@@ -278,14 +298,35 @@ def assess(context, validated_selection, review):
             'eligible': count >= minimum and relevant > 0, 'cells': cells}
     if v3:
         hosts = {s['id']: urlsplit(s['url']).hostname.lower().rstrip('.') for s in sources}
-        support = {}
+        from .publisher_scope import enabled as scoped, transfer_scope
+        from .project_scope import enabled as project_policy
+        project_enabled = project_policy(context.get('goal', {}))
+        if project_enabled:
+            from .project_scope import transfer_scope
+        scope_enabled = scoped(context.get('goal', {})) or project_enabled
+        scopes = {s['id']: transfer_scope(s['url']) for s in sources} if scope_enabled else {}
+        support, scope_rejections, support_reasons = {}, {}, {}
         details = []
         for group in groups:
             for sid in group:
-                anchors = [a for a in group if hosts[a] == hosts[sid] and publishers[a] is not None]
+                anchors = [a for a in group if publishers[a] is not None and
+                           (a == sid or scopes[sid] is not None and scopes[a] == scopes[sid]
+                            if scope_enabled else hosts[a] == hosts[sid])]
                 # Same registrable-domain family is not enough to transfer identity.
                 names = {publishers[a] for a in anchors}
-                support[sid] = anchors[0] if len(names) == 1 else None
+                coexist = (roles_enabled and len(names) > 1 and
+                           compatible({s['id']: s for s in sources}, anchors, publisher_roles))
+                support[sid] = anchors[0] if len(names) == 1 or coexist else None
+                if scope_enabled:
+                    rejected = [a for a in group if publishers[a] is not None
+                                and hosts[a] == hosts[sid] and a not in anchors]
+                    scope_rejections[sid] = rejected
+                    support_reasons[sid] = ('project_roles_coexist' if coexist else
+                        'supported' if support[sid] is not None else
+                        'publisher_identity_conflict' if len(names) > 1 else
+                        'publisher_scope_mismatch' if rejected else
+                        ('project_scope_missing' if project_enabled else 'repository_scope_missing')
+                        if scopes[sid] is None else 'attribution_missing')
             identity = all(support[sid] is not None for sid in group)
             consistent = all(pairs[tuple(sorted((ids.index(a), ids.index(b))))]['relation'] != 'independent'
                              for a,b in combinations(group,2))
@@ -306,4 +347,9 @@ def assess(context, validated_selection, review):
         result.update(independent_count=independent,complete_independent_count=complete,required_independent_count=minimum,
                       group_details=details,publisher_support=support,publisher_evidence=publisher_evidence,
                       eligible=complete>=minimum)
+        if scope_enabled:
+            result.update(publisher_scopes={sid: list(scope) if scope else None for sid, scope in scopes.items()},
+                          publisher_scope_rejections=scope_rejections, publisher_support_reasons=support_reasons)
+        if roles_enabled:
+            result['publisher_roles'] = {sid: publisher_roles.get(sid) for sid in ids}
     return result

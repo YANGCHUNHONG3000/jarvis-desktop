@@ -54,6 +54,12 @@ Cloud model calls require both a local API key and an explicit local permission 
 
 The service applies both a New York calendar-day and rolling-24-hour cap of CNY 5. Unresolved reservations count against the cap. Do not remove or edit budget records to make more spending available.
 
+The current text-only client reserves against the serialized request size and
+the bounded output, not the full model context. It validates provider pricing
+and model limits before a paid request. If credible returned usage exceeds the
+request bound, it records that usage and persistently stops further paid calls.
+Keep the ledger for investigation; replacing it is not a recovery procedure.
+
 ## Data and recovery
 
 Run records and documents are stored locally under data directories. Review those outputs before sharing them. A workflow marked `unknown` means an external effect may have occurred without a verified receipt; do not manually trigger a replay unless you have independently established the actual state. Sign-in and CAPTCHA are always completed manually.

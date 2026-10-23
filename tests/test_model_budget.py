@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from decimal import Decimal
 import subprocess
+import sqlite3
 import sys
 from zoneinfo import ZoneInfo
 
@@ -171,3 +172,118 @@ except BudgetError:
     assert all(proc.returncode == 0 for proc in processes), outcomes
     assert [stdout.strip() for stdout, _ in outcomes].count("reserved") == 2
     assert BudgetLedger(path, limit_micro=2_000_000).snapshot()["held_micro"] == 2_000_000
+
+
+@pytest.mark.parametrize("charge", [90, 120])
+def test_overrun_records_actual_charge_and_permanently_blocks_new_reservations(tmp_path, charge):
+    path = tmp_path / "budget.sqlite3"
+    clock = Clock(instant(2026, 1, 1))
+    ledger = BudgetLedger(path, limit_micro=100, clock=clock)
+    rid = ledger.reserve(80, "request")
+    pending = ledger.reserve(20, "unrelated-unknown")
+    ledger.settle_overrun(rid, charge, {"tokens": 45})
+    assert ledger.snapshot() == {"limit_micro": 100, "charged_micro": charge,
+                                 "held_micro": 20, "remaining_micro": 0}
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT reservation_id, fault_code, reserved_micro, charge_micro "
+                          "FROM budget_faults").fetchall() == [(rid, "reservation_overrun", 80, charge)]
+    clock.value = instant(2027, 1, 1)
+    reopened = BudgetLedger(path, limit_micro=100, clock=clock)
+    assert reopened.snapshot()["charged_micro"] == 0
+    assert reopened.snapshot()["held_micro"] == 20
+    assert reopened.snapshot()["remaining_micro"] == 0
+    with pytest.raises(BudgetError, match="model budget accounting fault"):
+        reopened.reserve(1, "blocked-even-after-rollover")
+    # In-flight requests can still settle; unrelated unknown holds stay intact.
+    reopened.settle(pending, 10, {})
+    assert reopened.snapshot()["held_micro"] == 0
+    assert reopened.snapshot()["remaining_micro"] == 0
+
+
+@pytest.mark.parametrize("charge", [0, 60, 80, 90])
+def test_request_bound_anomaly_halts_even_when_charge_fits_reservation(tmp_path, charge):
+    ledger = BudgetLedger(tmp_path / "budget.sqlite3", limit_micro=100)
+    rid = ledger.reserve(80, "request")
+    usage = {"prompt_tokens": 100, "completion_tokens": 0}
+    ledger.settle_anomaly(rid, charge, usage, reason="request_bound_exceeded")
+    ledger.settle_anomaly(rid, charge, dict(reversed(list(usage.items()))), reason="request_bound_exceeded")
+    assert ledger.snapshot()["charged_micro"] == charge
+    assert ledger.snapshot()["held_micro"] == 0
+    assert ledger.snapshot()["remaining_micro"] == 0
+    with pytest.raises(BudgetError, match="model budget accounting fault"):
+        ledger.reserve(1, "blocked")
+    with pytest.raises(BudgetError, match="already settled"):
+        ledger.settle_anomaly(rid, charge + 1, usage, reason="request_bound_exceeded")
+    with pytest.raises(BudgetError):
+        ledger.settle_overrun(rid, charge, usage)
+
+
+def test_anomaly_validation_preserves_pending_reservation(tmp_path):
+    ledger = BudgetLedger(tmp_path / "budget.sqlite3", limit_micro=100)
+    rid = ledger.reserve(80, "request")
+    for bad in (-1, 81.0, Decimal("81"), True, 0, 80):
+        with pytest.raises(BudgetError):
+            ledger.settle_overrun(rid, bad, {})
+    for bad_usage in ([], {"bad": float("nan")}, {"bad": object()}):
+        with pytest.raises(BudgetError):
+            ledger.settle_overrun(rid, 81, bad_usage)
+    with pytest.raises(BudgetError, match="unknown reservation"):
+        ledger.settle_overrun("missing", 81, {})
+    with pytest.raises(BudgetError, match="nonempty string"):
+        ledger.settle_overrun("", 81, {})
+    with pytest.raises(BudgetError, match="unknown budget anomaly reason"):
+        ledger.settle_anomaly(rid, 81, {}, reason="unrecognized")
+    assert ledger.snapshot()["held_micro"] == 80
+    assert ledger.snapshot()["remaining_micro"] == 20
+    # An ordinary, already-settled row cannot be rewritten into an anomaly.
+    ledger.settle(rid, 60, {})
+    with pytest.raises(BudgetError, match="already settled"):
+        ledger.settle_anomaly(rid, 60, {}, reason="request_bound_exceeded")
+    assert ledger.snapshot()["charged_micro"] == 60
+    assert ledger.snapshot()["remaining_micro"] == 40
+
+
+def test_overrun_retries_are_idempotent_and_conflicts_cannot_change_truth(tmp_path):
+    path = tmp_path / "budget.sqlite3"
+    ledger = BudgetLedger(path, limit_micro=100)
+    rid = ledger.reserve(80, "request")
+    ledger.settle_overrun(rid, 90, {"b": 2, "a": 1})
+    ledger.settle_overrun(rid, 90, {"a": 1, "b": 2})
+    for charge, usage in ((91, {"a": 1, "b": 2}), (90, {"a": 2, "b": 2})):
+        with pytest.raises(BudgetError, match="already settled"):
+            ledger.settle_overrun(rid, charge, usage)
+    with pytest.raises(BudgetError, match="already settled"):
+        ledger.settle_anomaly(rid, 90, {"a": 1, "b": 2}, reason="request_bound_exceeded")
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM budget_faults").fetchone() == (1,)
+    assert ledger.snapshot()["charged_micro"] == 90
+
+
+def test_failed_fault_insert_rolls_back_anomaly_settlement(tmp_path):
+    path = tmp_path / "budget.sqlite3"
+    ledger = BudgetLedger(path, limit_micro=100)
+    rid = ledger.reserve(80, "request")
+    with sqlite3.connect(path) as db:
+        db.execute("""CREATE TRIGGER reject_fault BEFORE INSERT ON budget_faults
+                      BEGIN SELECT RAISE(ABORT, 'fault_storage_failed'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match="fault_storage_failed"):
+        ledger.settle_overrun(rid, 90, {})
+    assert ledger.snapshot()["held_micro"] == 80
+    assert ledger.snapshot()["charged_micro"] == 0
+    assert ledger.snapshot()["remaining_micro"] == 20
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM budget_faults").fetchone() == (0,)
+
+
+def test_fault_table_migration_preserves_legacy_reservations(tmp_path):
+    path = tmp_path / "budget.sqlite3"
+    ledger = BudgetLedger(path, limit_micro=100)
+    rid = ledger.reserve(80, "legacy-unknown")
+    with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE budget_faults")
+    reopened = BudgetLedger(path, limit_micro=100)
+    assert reopened.snapshot()["held_micro"] == 80
+    assert reopened.snapshot()["remaining_micro"] == 20
+    reopened.settle_overrun(rid, 90, {})
+    assert reopened.snapshot()["charged_micro"] == 90
+    assert reopened.snapshot()["remaining_micro"] == 0
