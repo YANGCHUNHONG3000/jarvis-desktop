@@ -1,4 +1,4 @@
-"""One-shot continuation of an explicitly cancelled, supervised local skill.
+"""Explicit continuation of a cancelled or pre-dispatch blocked local skill.
 
 The publisher grants one task only after its original result and disabled
 candidate state are durable.  This module never enables the candidate again.
@@ -23,6 +23,8 @@ _ATTEMPT = re.compile(r"[0-9a-f]{32}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _PERMIT = "skill-resume-permit.json"
 _POINTER = "skill-resume-latest.json"
+_PREFLIGHT_BLOCKS = {"office_ui_blocked", "office_ui_unavailable"}
+_MAX_ATTEMPTS = 32
 
 
 class SkillResumeError(ValueError):
@@ -51,8 +53,12 @@ def _identity(task, base, store, *, current):
             or type(info["sha256"]) is not str or not _HASH.fullmatch(info["sha256"])
             or type(info["implementation_sha256"]) is not str
             or not _HASH.fullmatch(info["implementation_sha256"])
-            or info["mode"] not in {"active", "trial"} or parent["state"] != "cancelled"
+            or info["mode"] not in {"active", "trial"}
+            or parent["state"] not in {"cancelled", "failed"}
             or parent["ok"] is not False):
+        raise SkillResumeError("skill_resume_parent_invalid")
+    blocked = parent["state"] == "failed"
+    if blocked and parent.get("error") not in _PREFLIGHT_BLOCKS:
         raise SkillResumeError("skill_resume_parent_invalid")
     request = workflow._read_json(task / "skill-request.json")
     root = skills._store(store) if current else Path(store).absolute()
@@ -72,7 +78,7 @@ def _identity(task, base, store, *, current):
                         "workflow_root": str(workflow_root)}
     binding = request.get("source_retry")
     from .adapter_development import external_trial_binding
-    development_binding = external_trial_binding(task, base, store)
+    development_binding = external_trial_binding(task, base, store) if current or not blocked else None
     if development_binding is not None and binding != development_binding:
         raise SkillResumeError("skill_resume_source_changed")
     if binding is not None:
@@ -85,19 +91,22 @@ def _identity(task, base, store, *, current):
     if request != expected_request:
         raise SkillResumeError("skill_resume_request_invalid")
     original_count = snapshot["original_completed"]
-    if not 1 <= original_count < len(snapshot["steps"]):
+    if not (0 if blocked else 1) <= original_count < len(snapshot["steps"]):
         raise SkillResumeError("skill_resume_boundary_invalid")
-    if not snapshot["receipts"] or len(snapshot["receipts"]) < original_count:
+    if len(snapshot["receipts"]) < original_count:
         raise SkillResumeError("skill_resume_boundary_invalid")
     cancelled = task / "cancel.flag"
-    if ordinary._linked(cancelled) or not cancelled.is_file():
+    if not blocked and (ordinary._linked(cancelled) or not cancelled.is_file()):
         raise SkillResumeError("skill_resume_cancel_invalid")
     run = workflow._read_json(workflow_root / "result.json")
     original_ids = [step["id"] for step in snapshot["steps"][:original_count]]
-    if (run.get("ok") is not False or run.get("state") != "cancelled"
+    if (run.get("ok") is not False or run.get("state") != parent["state"]
             or run.get("root") != str(workflow_root)
             or run.get("completed") != original_ids
             or run.get("receipts") != {key: snapshot["receipts"][key] for key in original_ids}):
+        raise SkillResumeError("skill_resume_boundary_invalid")
+    if blocked and run != _v2_run(_prefix_snapshot(snapshot, original_count),
+                                 "blocked", parent["error"]):
         raise SkillResumeError("skill_resume_boundary_invalid")
     if current and info["mode"] == "active":
         state = skills._state(root, info["id"])
@@ -152,8 +161,9 @@ def _evidence(task, base, store, *, current, archived=None):
     task, parent, original_hash, info, root, version, candidate, snapshot = _identity(
         task, base, store, current=current)
     original_count = snapshot["original_completed"]
+    blocked = parent["state"] == "failed"
     if current:
-        if (len(snapshot["receipts"]) != original_count
+        if (not blocked and len(snapshot["receipts"]) != original_count
                 or info["implementation_sha256"] != skills.implementation_sha256()):
             raise SkillResumeError("skill_resume_changed")
         source = workflow._read_json(task / "sources" / "source.json")
@@ -168,15 +178,16 @@ def _evidence(task, base, store, *, current, archived=None):
             skills._gate_file(version, gate, info["sha256"])
         if info["mode"] == "active":
             skills._live_check(version, info["sha256"], base)
-    _native_prefix(snapshot, original_count)
+    _native_prefix(snapshot, len(snapshot["receipts"]) if blocked else original_count)
     files = {
         "result.json": original_hash,
         "skill-request.json": _digest(task / "skill-request.json"),
-        "cancel.flag": _digest(task / "cancel.flag", 100_000, allow_empty=True),
         "sources/source.json": _digest(task / "sources" / "source.json"),
         "workflow/manifest.json": snapshot["manifest_sha256"],
         "workflow/result.json": _digest(snapshot["workflow_root"] / "result.json"),
     }
+    if not blocked:
+        files["cancel.flag"] = _digest(task / "cancel.flag", 100_000, allow_empty=True)
     if current:
         files["store/manifest.json"] = _digest(version / "manifest.json")
         for gate in ("offline.json", "review.json"):
@@ -207,11 +218,15 @@ def _evidence(task, base, store, *, current, archived=None):
     for step in snapshot["steps"][:original_count]:
         step_id = step["id"]
         step_root = snapshot["workflow_root"] / step_id
-        for name in ("intent.json", "receipt.json", "worker-request.json", "worker-outcome.json"):
+        names = ("intent.json", "receipt.json", "worker-request.json", "worker-outcome.json")
+        if blocked and step["action"] == "email_draft":
+            names = ("intent.json", "receipt.json")
+        for name in names:
             files[f"workflow/{step_id}/{name}"] = _digest(step_root / name)
         receipt = snapshot["receipts"][step_id]
-        files[f"workflow/{step_id}/artifact"] = _digest(Path(receipt["artifact"]), 20_000_000)
-    return {"schema": 1, "task_root": str(task), "workflow_root": str(snapshot["workflow_root"]),
+        limit = 45_000_000 if blocked and step["action"] == "email_draft" else 20_000_000
+        files[f"workflow/{step_id}/artifact"] = _digest(Path(receipt["artifact"]), limit)
+    return {"schema": 2 if blocked else 1, "task_root": str(task), "workflow_root": str(snapshot["workflow_root"]),
             "store_root": str(root), "skill_id": info["id"], "candidate_sha256": info["sha256"],
             "mode": info["mode"],
             "implementation_sha256": info["implementation_sha256"],
@@ -227,17 +242,24 @@ def _permit(task):
         raise SkillResumeError("skill_resume_permit_invalid")
     if value["evidence_sha256"] != workflow._hash(value["evidence"]):
         raise SkillResumeError("skill_resume_permit_invalid")
+    if (type(value["evidence"]) is not dict
+            or type(value["evidence"].get("schema")) is not int
+            or value["evidence"]["schema"] not in {1, 2}):
+        raise SkillResumeError("skill_resume_permit_invalid")
     return value
 
 
 def mint_permit(task_root, base, store):
-    """Publisher-only call after a durable cancelled parent and blocked state."""
+    """Publisher-only call after a durable safe boundary and disabled state."""
     task = ordinary._task(task_root, base)
     # Caller already owns store and task. Workflow is acquired last.
     parent = workflow._read_json(task / "result.json")
     workflow_root = ordinary._manifest(task, parent)[0]
     with workflow._owner(workflow_root):
-        evidence, _ = _evidence(task, base, store, current=True)
+        evidence, snapshot = _evidence(task, base, store, current=True)
+        if evidence["schema"] == 2 and (len(snapshot["receipts"]) != snapshot["original_completed"]
+                or _attempts(task) or (task / _POINTER).exists() or ordinary._linked(task / _POINTER)):
+            raise SkillResumeError("skill_resume_boundary_invalid")
         if (task / _PERMIT).exists() or ordinary._linked(task / _PERMIT):
             raise SkillResumeError("skill_resume_permit_exists")
         workflow._write_new(task / _PERMIT,
@@ -273,6 +295,150 @@ def _attempts(task):
             and p.name not in {_PERMIT, _POINTER}]
 
 
+def _prefix_snapshot(snapshot, count):
+    """Reconstruct a historical contiguous prefix from currently verified bytes."""
+    if (type(count) is not int
+            or not snapshot["original_completed"] <= count <= len(snapshot["receipts"])):
+        raise SkillResumeError("skill_resume_chain_invalid")
+    value = dict(snapshot)
+    ids = [step["id"] for step in snapshot["steps"][:count]]
+    value["receipts"] = {key: snapshot["receipts"][key] for key in ids}
+    hashes = [[key, _digest(snapshot["workflow_root"] / key / "receipt.json"),
+               snapshot["receipts"][key]["sha256"]] for key in ids]
+    value["token"] = workflow._hash({"original": snapshot["original_sha256"],
+                                     "manifest": snapshot["manifest_sha256"], "receipts": hashes})
+    return value
+
+
+def _v2_run(snapshot, state, error=None):
+    """Exact workflow boundary contract; an error name alone grants nothing."""
+    count = len(snapshot["receipts"])
+    total = len(snapshot["steps"])
+    if (state not in {"blocked", "succeeded", "cancelled", "timed_out"}
+            or state == "succeeded" and count != total
+            or state != "succeeded" and count >= total):
+        raise SkillResumeError("skill_resume_boundary_invalid")
+    run = {"ok": state == "succeeded", "state": "failed" if state == "blocked" else state,
+           "root": str(snapshot["workflow_root"]),
+           "completed": list(snapshot["receipts"]), "receipts": snapshot["receipts"]}
+    if state == "blocked":
+        step = snapshot["steps"][count]
+        if error not in _PREFLIGHT_BLOCKS or step["action"] == "email_draft":
+            raise SkillResumeError("skill_resume_boundary_invalid")
+        run.update(step=step["id"], error=error)
+    elif error is not None:
+        raise SkillResumeError("skill_resume_boundary_invalid")
+    return run
+
+
+def _v2_token(permit, snapshot, previous):
+    return workflow._hash({"permit": workflow._hash(permit), "snapshot": snapshot["token"],
+                           "previous_attempt_id": previous[0],
+                           "previous_outcome_sha256": previous[1]})
+
+
+def _v2_request(task, permit, snapshot, attempt_id, previous):
+    return {"version": 2, "attempt_id": attempt_id, "task_root": str(task),
+            "permit_sha256": _digest(task / _PERMIT),
+            "expected_token": _v2_token(permit, snapshot, previous),
+            "previous_attempt_id": previous[0], "previous_outcome_sha256": previous[1],
+            "before_completed": len(snapshot["receipts"]),
+            "before_snapshot_token": snapshot["token"]}
+
+
+def _v2_outcome(snapshot, attempt_id, request, request_hash, run_hash, state, error=None):
+    value = _outcome(snapshot, attempt_id, request["expected_token"], state, error)
+    value.update(version=2, request_sha256=request_hash, run_sha256=run_hash)
+    return value
+
+
+def _v2_pointer(outcome, outcome_hash):
+    return {"version": 2, "attempt_id": outcome["attempt_id"],
+            "original_sha256": outcome["original_sha256"],
+            "manifest_sha256": outcome["manifest_sha256"],
+            "token_after": outcome["token_after"], "outcome_sha256": outcome_hash}
+
+
+def _v2_record(path):
+    raw = _raw(path)
+    return ordinary._json_bytes(raw), sha256(raw).hexdigest()
+
+
+def _v2_chain(task, permit, snapshot, *, exclude=None, check_pointer=True):
+    """Validate the entire bounded chain, including historical prefix snapshots.
+
+    No incomplete, branching, orphaned, or unknown attempt grants another run.
+    A blocked attempt can extend the prefix, but only with verified receipts.
+    """
+    attempts = _attempts(task)
+    if exclude is not None:
+        attempts = [path for path in attempts if path != exclude]
+    if len(attempts) > _MAX_ATTEMPTS:
+        raise SkillResumeError("skill_resume_attempt_limit")
+    successors = {}
+    for attempt in attempts:
+        attempt_id = attempt.name.removeprefix("skill-resume-")
+        if (not _ATTEMPT.fullmatch(attempt_id) or ordinary._linked(attempt) or not attempt.is_dir()
+                or any(child.name not in {"request.json", "result.json", "outcome.json", "cancel.flag"}
+                       or ordinary._linked(child) or not child.is_file() for child in attempt.iterdir())):
+            raise SkillResumeError("skill_resume_chain_invalid")
+        request, request_hash = _v2_record(attempt / "request.json")
+        outcome, outcome_hash = _v2_record(attempt / "outcome.json")
+        run, run_hash = _v2_record(attempt / "result.json")
+        previous_id = request.get("previous_attempt_id")
+        if previous_id is not None and (type(previous_id) is not str or not _ATTEMPT.fullmatch(previous_id)):
+            raise SkillResumeError("skill_resume_chain_invalid")
+        if previous_id in successors:
+            raise SkillResumeError("skill_resume_chain_invalid")
+        successors[previous_id] = (attempt_id, request, request_hash, outcome, outcome_hash, run, run_hash)
+    previous = (None, None)
+    prefix = _prefix_snapshot(snapshot, snapshot["original_completed"])
+    chain = []
+    while previous[0] in successors:
+        if chain and chain[-1]["outcome"]["state"] != "blocked":
+            raise SkillResumeError("skill_resume_chain_closed")
+        attempt_id, request, request_hash, outcome, outcome_hash, run, run_hash = successors.pop(previous[0])
+        if request != _v2_request(task, permit, prefix, attempt_id, previous):
+            raise SkillResumeError("skill_resume_chain_invalid")
+        count = outcome.get("completed")
+        if type(count) is not int or not len(prefix["receipts"]) <= count <= len(snapshot["receipts"]):
+            raise SkillResumeError("skill_resume_chain_invalid")
+        after = _prefix_snapshot(snapshot, count)
+        state, error = outcome.get("state"), outcome.get("error")
+        if run != _v2_run(after, state, error):
+            raise SkillResumeError("skill_resume_chain_invalid")
+        if outcome != _v2_outcome(after, attempt_id, request, request_hash, run_hash, state, error):
+            raise SkillResumeError("skill_resume_chain_invalid")
+        chain.append({"attempt_id": attempt_id, "outcome": outcome,
+                      "outcome_sha256": outcome_hash})
+        prefix = after
+        previous = (attempt_id, outcome_hash)
+    if successors or prefix["token"] != snapshot["token"]:
+        raise SkillResumeError("skill_resume_chain_invalid")
+    pointer = task / _POINTER
+    if check_pointer:
+        if chain:
+            value, _ = _v2_record(pointer)
+            if value != _v2_pointer(chain[-1]["outcome"], chain[-1]["outcome_sha256"]):
+                raise SkillResumeError("skill_resume_chain_invalid")
+        elif pointer.exists() or ordinary._linked(pointer):
+            raise SkillResumeError("skill_resume_chain_invalid")
+    return chain
+
+
+def _v2_previous(chain):
+    if not chain:
+        return None, None
+    return chain[-1]["attempt_id"], chain[-1]["outcome_sha256"]
+
+
+def _v2_open(chain):
+    if chain and chain[-1]["outcome"]["state"] != "blocked":
+        raise SkillResumeError("skill_resume_already_attempted")
+    if len(chain) >= _MAX_ATTEMPTS:
+        raise SkillResumeError("skill_resume_attempt_limit")
+
+
 def preview_resume(task_root, base, store=None):
     empty = {"eligible": False, "reason": "skill_resume_unavailable", "kind": "skill_resume",
              "task_root": None, "workflow_root": None, "token": None,
@@ -280,11 +446,17 @@ def preview_resume(task_root, base, store=None):
     try:
         task = ordinary._task(task_root, base)
         permit, snapshot = _ready(task, base, store or _store_default(base), current=True)
-        if _attempts(task) or (task / _POINTER).exists() or ordinary._linked(task / _POINTER):
+        if permit["evidence"]["schema"] == 2:
+            chain = _v2_chain(task, permit, snapshot)
+            _v2_open(chain)
+            token = _v2_token(permit, snapshot, _v2_previous(chain))
+        elif _attempts(task) or (task / _POINTER).exists() or ordinary._linked(task / _POINTER):
             raise SkillResumeError("skill_resume_already_attempted")
+        else:
+            token = _token(permit, snapshot)
         return {"eligible": True, "reason": "ready", "kind": "skill_resume",
                 "task_root": str(task), "workflow_root": str(snapshot["workflow_root"]),
-                "token": _token(permit, snapshot), "completed": len(snapshot["receipts"]),
+                "token": token, "completed": len(snapshot["receipts"]),
                 "total": len(snapshot["steps"]), "remaining": len(snapshot["steps"]) - len(snapshot["receipts"])}
     except (ValueError, OSError, KeyError, TypeError) as exc:
         code = str(exc) if isinstance(exc, ValueError) else "skill_resume_unavailable"
@@ -297,6 +469,70 @@ def _outcome(snapshot, attempt_id, token, state, error=None):
     value = ordinary._outcome(snapshot, attempt_id, token, state, error=error)
     value["kind"] = "skill_resume"
     return value
+
+
+def _resume_v2(task, base, store, permit, before, expected_token, attempt_id, deadline):
+    """Called under store/task locks; the workflow acquires its lock last."""
+    attempt = task / ("skill-resume-" + attempt_id)
+    if ordinary._linked(attempt):
+        raise SkillResumeError("skill_resume_attempt_invalid")
+    if attempt.exists() and (not attempt.is_dir() or any(
+            child.name != "cancel.flag" or ordinary._linked(child) or not child.is_file()
+            for child in attempt.iterdir())):
+        raise SkillResumeError("skill_resume_already_attempted")
+    chain = _v2_chain(task, permit, before, exclude=attempt)
+    _v2_open(chain)
+    previous = _v2_previous(chain)
+    if _v2_token(permit, before, previous) != expected_token:
+        raise SkillResumeError("skill_resume_preview_stale")
+    if not attempt.exists():
+        attempt.mkdir(exist_ok=False)
+    cancel = attempt / "cancel.flag"
+    request = _v2_request(task, permit, before, attempt_id, previous)
+    workflow._write_new(attempt / "request.json", request)
+    request_hash = _digest(attempt / "request.json")
+    after, run_hash = before, None
+    try:
+        def guard():
+            present, snapshot = _ready(task, base, store, current=True)
+            current_chain = _v2_chain(task, present, snapshot, exclude=attempt)
+            _v2_open(current_chain)
+            if (_v2_token(present, snapshot, _v2_previous(current_chain)) != expected_token
+                    or _v2_record(attempt / "request.json") != (request, request_hash)
+                    or any(child.name not in {"request.json", "cancel.flag"}
+                           or ordinary._linked(child) or not child.is_file()
+                           for child in attempt.iterdir())):
+                raise SkillResumeError("skill_resume_preview_stale")
+
+        run = workflow.run_office_workflow(
+            before["steps"], before["workflow_root"], resume=True,
+            deadline=deadline, cancel_file=cancel, result_root=attempt, resume_guard=guard)
+        _, after = _ready(task, base, store, current=False)
+        saved_run, run_hash = _v2_record(attempt / "result.json")
+        state = run.get("state")
+        error = None
+        if state == "failed" and run.get("error") in _PREFLIGHT_BLOCKS:
+            state, error = "blocked", run["error"]
+        if saved_run != run or run != _v2_run(after, state, error):
+            raise SkillResumeError("skill_resume_boundary_invalid")
+        result = _v2_outcome(after, attempt_id, request, request_hash, run_hash, state, error)
+    except Exception as exc:
+        code = str(exc) if isinstance(exc, ValueError) else "skill_resume_failed"
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+            code = "skill_resume_failed"
+        result = _v2_outcome(after, attempt_id, request, request_hash, run_hash, "unknown", code)
+    ordinary._publish(attempt / "outcome.json", result)
+    if result["state"] in {"succeeded", "cancelled", "timed_out", "blocked"}:
+        # Validate the newly persisted member before advancing the only mutable
+        # pointer. A crash or malformed record leaves an unusable orphan.
+        verified = _v2_chain(task, permit, after, check_pointer=False)
+        pointer = _v2_pointer(result, verified[-1]["outcome_sha256"])
+        temporary = task / (".skill-resume-latest." + uuid.uuid4().hex + ".tmp")
+        if ordinary._linked(task / _POINTER):
+            raise SkillResumeError("skill_resume_chain_invalid")
+        workflow._write_new(temporary, pointer)
+        os.replace(temporary, task / _POINTER)
+    return result
 
 
 def resume_task(task_root, base, *, expected_token, attempt_id, store=None, deadline=None):
@@ -313,6 +549,8 @@ def resume_task(task_root, base, *, expected_token, attempt_id, store=None, dead
     with workflow._owner(store):
         with workflow._owner(task):
             permit, before = _ready(task, base, store, current=True)
+            if permit["evidence"]["schema"] == 2:
+                return _resume_v2(task, base, store, permit, before, expected_token, attempt_id, deadline)
             if _token(permit, before) != expected_token:
                 raise SkillResumeError("skill_resume_preview_stale")
             if (any(p != task / ("skill-resume-" + attempt_id) for p in _attempts(task))
@@ -387,6 +625,9 @@ def read_resume_result(task_root, attempt_root, base):
         attempt_id = attempt.name[len("skill-resume-"):]
         unknown["attempt_id"] = attempt_id
         permit, snapshot = _ready(task, base, _store_default(base), current=False)
+        if permit["evidence"]["schema"] == 2:
+            chain = _v2_chain(task, permit, snapshot)
+            return next((item["outcome"] for item in chain if item["attempt_id"] == attempt_id), unknown)
         request = workflow._read_json(attempt / "request.json")
         outcome = workflow._read_json(attempt / "outcome.json")
         if request != {"version": 1, "attempt_id": attempt_id, "task_root": str(task),
@@ -428,6 +669,12 @@ def latest_continuation(task_root, base):
     try:
         task = ordinary._task(task_root, base)
         pointer = workflow._read_json(task / _POINTER)
+        if pointer.get("version") == 2:
+            permit, snapshot = _ready(task, base, _store_default(base), current=False)
+            if permit["evidence"]["schema"] != 2:
+                return None
+            chain = _v2_chain(task, permit, snapshot)
+            return chain[-1]["outcome"] if chain else None
         if (set(pointer) != {"version", "attempt_id", "original_sha256", "manifest_sha256",
                              "token_after", "outcome_sha256"} or pointer["version"] != 1
                 or type(pointer["attempt_id"]) is not str

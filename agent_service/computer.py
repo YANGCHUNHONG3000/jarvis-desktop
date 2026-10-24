@@ -12,6 +12,8 @@ import re
 import time
 import uuid
 
+from .verification_progress import checkpoint as verification_checkpoint
+
 ROOT = Path(__file__).resolve().parents[1]
 BASE = ROOT / 'data' / 'computer_sessions'
 TTL = 120
@@ -39,10 +41,13 @@ def write_new(path, value):
 
 
 def read_record(path):
+    verification_checkpoint()
     path = Path(path)
     if path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction()) or path.stat().st_size > 300_000:
         raise ComputerError('record_invalid')
-    return json.loads(path.read_text(encoding='utf-8'))
+    result = json.loads(path.read_text(encoding='utf-8'))
+    verification_checkpoint(records=1)
+    return result
 
 
 def safe_root(path):

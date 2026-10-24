@@ -103,7 +103,8 @@ def call_model(context, callback):
             from .publisher_roles import enabled as role_policy, candidates
             if role_policy(context['goal']):
                 source = next(s for s in context['sources'] if s['id'] == row['id'])
-                choices = candidates(source)
+                choices = candidates(source,
+                    policy=context['goal']['comparison']['publisher_policy'])
                 if source.get('project_role_candidates') != choices:
                     _fail()
                 publisher = row['publisher']

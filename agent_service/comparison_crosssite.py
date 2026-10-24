@@ -632,6 +632,8 @@ def followup_manifest(previous_run, source_ids=None):
     try:
         return create_manifest(previous_run) if source_ids is None else create_manifest(previous_run, source_ids)
     except ComputerError as exc:
+        from .verification_progress import checkpoint
+        checkpoint()  # A stop request must not enter another import fallback.
         if str(exc) != 'comparison_failed_seed_invalid':
             raise
     from .comparison_compact_seed import create_manifest as compact_manifest

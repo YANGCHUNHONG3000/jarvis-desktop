@@ -30,6 +30,20 @@ The test command is a focused fixture-driven example; it is not an end-to-end ac
 
 ## Launchers
 
+### Continuing with verified Office outputs
+
+In the main GUI, use **历史任务 → 整批用于能力模式** to select one inspected
+task's 2–4 Word/Excel outputs. The source label identifies the selected task;
+**改用上一任务成果** explicitly switches back to the latest outputs.
+
+In **连续任务 → 根据任务匹配技能／适配器**, enter the complete task and use
+**按任务规划（云端）** for a metadata-only route proposal. This requires the same
+local model permission and budget as other cloud calls. Check the selected
+sources and full plan before approving execution. Ambiguous or unsupported joint
+requests may require clarification; no new code is executed automatically.
+Completed supported outputs can be carried into the next task without browsing
+for their paths. Do not expect arbitrary document layouts or semantic merging.
+
 Run a launcher from the project root, for example:
 
 ```powershell

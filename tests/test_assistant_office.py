@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_service import assistant
+from agent_service import assistant, office_readiness
 from agent_service.contracts import Observation
 from agent_service.research import run_research
 
@@ -13,6 +13,11 @@ from agent_service.research import run_research
 URLS = ["https://example.org/first", "https://example.net/second"]
 EXCERPTS = ["Primary source reports three completed tasks.",
             "Secondary source reports two reviewed tasks."]
+
+
+@pytest.fixture(autouse=True)
+def offline_office_readiness(monkeypatch):
+    monkeypatch.setattr(office_readiness, "preflight_office_window", lambda: None)
 
 
 class FakeClient:

@@ -15,7 +15,7 @@ PROFILE = {'direct-pinned-v1', 'hf-loopback-connect-v1'}
 
 
 def enabled(goal):
-    return goal.get('comparison', {}).get('publisher_policy') in {POLICY, 'project_attribution_v5'}
+    return goal.get('comparison', {}).get('publisher_policy') in {POLICY, 'project_attribution_v5', 'project_attribution_v6'}
 
 
 def _reject():

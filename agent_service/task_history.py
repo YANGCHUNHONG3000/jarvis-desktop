@@ -308,9 +308,19 @@ def inspect_task(task_root, base):
         return output
     result = _json_small(root / "result.json")
     state, kind = _metadata(result, root)
+    bundle_owned = (type(result) is dict and 'bundle_sha256' in result) or (root / 'bundle-request.json').exists()
+    if bundle_owned:
+        try:
+            from .office_resume import _snapshot
+            _snapshot(root, base)
+        except (ValueError, OSError, KeyError, TypeError):
+            return {'root':str(root),'state':'needs_review','kind':'office','artifacts':[],
+                    'resume':{'eligible':False,'reason':'bundle_proof_invalid'}}
     skill_owned = (kind == "office" and type(result.get("skill")) is dict)
-    if skill_owned and state == "cancelled":
+    if skill_owned:
         from .skill_resume import latest_continuation, preview_resume
+    elif bundle_owned:
+        from .office_bundle_resume import latest_continuation, preview_resume
     else:
         from .office_resume import latest_continuation, preview_resume
     output = {"root": str(root), "state": state, "kind": kind, "artifacts": [],
@@ -350,12 +360,18 @@ def inspect_task(task_root, base):
             if skill_owned and (type(continuation) is not dict
                                 or continuation.get("kind") != "skill_resume"):
                 continuation = None
+            if output["resume"].get("eligible") is True:
+                reason = (continuation.get("error") if continuation is not None else result.get("error"))
+                if type(reason) is str and reason in {"office_ui_blocked", "office_ui_unavailable"}:
+                    output["preflight_block"] = reason
             if continuation is not None:
                 output["original_state"] = state
                 output["continuation"] = {"state": continuation["state"],
                                           "attempt_id": continuation["attempt_id"]}
                 if skill_owned:
                     output["continuation"]["kind"] = "skill_resume"
+                elif bundle_owned:
+                    output["continuation"]["kind"] = "bundle_resume"
                 for item in continuation["artifacts"]:
                     if item["step"] not in seen:
                         output["artifacts"].append(_artifact_record(

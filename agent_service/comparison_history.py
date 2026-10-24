@@ -2,6 +2,7 @@
 from copy import deepcopy
 
 from .computer import BASE, ComputerError, read_record, safe_root
+from .verification_progress import checkpoint, verification_scope
 
 
 def recent_candidates(*, base=BASE, stop=lambda: False):
@@ -37,12 +38,22 @@ def recent_candidates(*, base=BASE, stop=lambda: False):
                       and outcome.get('mode') == 'adapters' and outcome.get('artifacts') == [])
             if outcome.get('ok') is not True and not failed:
                 continue
+            recovered = False
             if 'recovery' in plan:
                 recovery = plan['recovery']
-                if (('comparison' in goal and not failed) or type(recovery) is not dict
-                        or recovery.get('kind') != 'research' or recovery.get('version') != 2
+                if (type(recovery) is not dict
+                        or recovery.get('kind') != 'research'
+                        or type(recovery.get('version')) is not int or recovery['version'] != 2
                         or type(recovery.get('depth')) is not int or recovery['depth'] != 1):
                     continue
+                if 'comparison' in goal and not failed:
+                    comparison = goal['comparison']
+                    ancestor = comparison.get('seed')
+                    if (type(comparison.get('evidence_version')) is not int
+                            or comparison['evidence_version'] != 4 or type(ancestor) is not dict
+                            or type(ancestor.get('version')) is not int or ancestor['version'] != 2):
+                        continue
+                    recovered = True
             if 'comparison' not in goal:
                 reads = outcome.get('source_reads')
                 if (outcome.get('engine') != 'observed_agent'
@@ -58,7 +69,8 @@ def recent_candidates(*, base=BASE, stop=lambda: False):
                            or 'recovery' in plan and goal['comparison'].get('evidence_version') != 4):
                 continue
             rows.append({'run': str(run), 'title': str(goal.get('title', ''))[:200],
-                         'kind': 'comparison_failed' if failed else 'research' if 'comparison' not in goal else 'comparison'})
+                         'kind': 'comparison_failed' if failed else 'comparison_recovered' if recovered
+                         else 'research' if 'comparison' not in goal else 'comparison'})
         except (OSError, ValueError, TypeError, AttributeError):
             continue
         if len(rows) == 30:
@@ -66,14 +78,19 @@ def recent_candidates(*, base=BASE, stop=lambda: False):
     return rows
 
 
-def select_source(run, *, stop=lambda: False):
-    from .comparison_seed import create_manifest, load_seed
+def select_source(run, *, stop=lambda: False, progress=lambda message: None):
+    with verification_scope(stop, progress, '核验历史任务、祖先回执与成果'):
+        return _select_source(run)
+
+
+def _select_source(run):
+    from .comparison_seed import load_seed
     from .comparison_panel import fields_from_goal, build_goal
-    if stop():
-        raise ComputerError('comparison_selection_cancelled')
     from .comparison_crosssite import followup_manifest
     manifest = followup_manifest(run)
+    checkpoint(stage='复查选中捕获')
     captures = load_seed(manifest)
+    checkpoint(stage='整理已核验来源与任务范围')
     goal = read_record(safe_root(run).with_suffix('.json'))['goal']
     # Rebuild only editable fields; a historical seed/recovery is never reused as a plan.
     fields = (fields_from_goal(goal) if 'comparison' in goal else {
@@ -81,8 +98,6 @@ def select_source(run, *, stop=lambda: False):
         'min_sources': '2', 'min_domains': '2'})
     fields.update(query1=manifest['queries'][0], query2=(manifest['queries'][1]
                   if len(manifest['queries']) > 1 else ''))
-    if stop():
-        raise ComputerError('comparison_selection_cancelled')
     return {'manifest': manifest, 'goal': build_goal(fields), 'fields': fields,
             'pages': [{'url': item['url'], 'query_index': item['query_index'],
                        **({'captured_at': record['observation']['captured_at']}
@@ -90,23 +105,27 @@ def select_source(run, *, stop=lambda: False):
                       for item, record in captures]}
 
 
-def prepare_selected(session, instruction, goal, selection, *, stop=lambda: False):
+def prepare_selected(session, instruction, goal, selection, *, stop=lambda: False,
+                     progress=lambda message: None):
+    with verification_scope(stop, progress, '重验已选历史来源'):
+        return _prepare_selected(session, instruction, goal, selection)
+
+
+def _prepare_selected(session, instruction, goal, selection):
     from .comparison_seed import load_seed
     from .comparison_crosssite import prepare_followup
-    if stop():
-        raise ComputerError('comparison_selection_cancelled')
     manifest = selection['manifest']
     load_seed(manifest)  # Selection-to-preview changes must fail, not bless new bytes.
+    checkpoint(stage='核对来源绑定并准备新目标')
     plan = prepare_followup(session, instruction, goal, manifest['run'], manifest['source_ids'])
     if plan['goal']['comparison']['seed'] != manifest:
         raise ComputerError('comparison_seed_changed')
-    if stop():
-        raise ComputerError('comparison_selection_cancelled')
     return plan
 
 
 def source_description(selection):
     kind = ('未完成对比的已核验捕获' if selection['manifest'].get('version') in {4, 5} else
+            '首次恢复对比的已核验捕获' if selection['manifest'].get('version') == 3 else
             '普通资料检索' if selection['manifest'].get('version') == 2 else '历史对比')
     return (kind + '来源：' + selection['manifest']['run'] + '\n' +
             '\n'.join(f"{i}. {p['url']}" +
@@ -126,7 +145,9 @@ def open_selector(parent, rows, on_select):
     box = tk.Listbox(win, exportselection=False)
     box.pack(fill='both', expand=True, padx=12)
     for row in rows:
-        prefix = '未完成对比·待核验' if row.get('kind') == 'comparison_failed' else '资料检索' if row.get('kind') == 'research' else '对比'
+        prefix = ('未完成对比·待核验' if row.get('kind') == 'comparison_failed' else
+                  '首次恢复对比·待核验' if row.get('kind') == 'comparison_recovered' else
+                  '资料检索' if row.get('kind') == 'research' else '对比')
         box.insert(tk.END, f"[{prefix}] {row['title']}")
     status = tk.StringVar(value='支持原有成功来源及受限的未完成对比捕获。失败来源须完整核验、无 Office 派发或未知作用；原查询保留，新任务须另行预览批准。列表不代表已通过核验。')
     ttk.Label(win, textvariable=status, wraplength=780).pack(fill='x', padx=12, pady=8)

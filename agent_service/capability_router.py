@@ -20,17 +20,30 @@ def _source(ref, base):
     verify_references([ref.get('artifact')], [ref], base=base)
 
 
-def prepare(session, instruction, *, source_ref=None, task_base=TASK_BASE):
+def prepare(session, instruction, *, source_ref=None, source_refs=None, task_base=TASK_BASE,
+            _clarification=None):
     from .skill_matching import discover_candidates
     if type(instruction) is not str or not 1 <= len(instruction.strip()) <= 4000:
         raise ComputerError('instruction_invalid')
     base = safe_root(task_base)
+    if source_refs is not None:
+        from .capability_source_choice import verify_refs
+        if source_ref is not None:
+            raise ComputerError('capability_source_conflict')
+        verify_refs(source_refs, base)
     _source(source_ref, base)
     found = discover_candidates(base.parent / 'capabilities', base, query=instruction)
-    return _save_goal(session, {'schema': 1, 'mode': 'capability',
+    value = {'schema': 1, 'mode': 'capability',
         'instruction': instruction.strip(), 'source_ref': deepcopy(source_ref),
         'task_base': str(base), 'request_id': uuid.uuid4().hex,
-        'candidates': found['candidates']})
+        'candidates': found['candidates']}
+    if source_refs is not None:
+        value.update(schema=2, source_refs=deepcopy(source_refs))
+    if _clarification is not None:
+        if source_refs is not None or source_ref is None:
+            raise ComputerError('capability_source_conflict')
+        value.update(schema=3, clarification=deepcopy(_clarification))
+    return _save_goal(session, value)
 
 
 def describe(plan):
@@ -44,6 +57,14 @@ def describe(plan):
     usable = [c for c in plan['candidates'] if c['reason'] == 'source_required']
     lines.append(f'预览时验证有效、待匹配来源的技能 {len(usable)} 个；执行前重新核验，不保证匹配。')
     lines.append('完成后 Office 成果自动接入下一任务；中断或结果未知时不重复已发出的操作。')
+    if plan.get('schema') == 2:
+        lines[2] = '来源：按任务从以下已核验成果中选择一份输入\n' + '\n'.join(
+            f"{i}. {r['artifact']}" for i, r in enumerate(plan['source_refs'], 1))
+        lines.append('批准后先用文件名/格式选择输入（单候选零模型、多候选至多一次调用），再上传选中内容。'
+                     '任务需要多份联合输入或无法确定时停止，请明确来源；未选正文不上传。')
+    elif plan.get('schema') == 3:
+        lines.append('已明确原任务的输入来源；本次为新批准，保留旧尝试，不重复调用选源模型。'
+                     '请核对这份输入能否满足全部任务；多份联合处理不在本次范围内。')
     return '\n'.join(lines)
 
 
@@ -103,9 +124,12 @@ def inspect_saved(run, *, task_base=TASK_BASE, computer_base=BASE):
         raise ComputerError('capability_session_invalid')
     approval = path.name.removesuffix('.capability')
     plan = read_record(path.parent / (approval + '.json'))
-    if (type(plan) is not dict or set(plan) != {'schema', 'mode', 'instruction',
-            'source_ref', 'task_base', 'request_id', 'candidates', 'sha256'}
-            or plan['schema'] != 1 or plan['mode'] != 'capability'
+    auto = type(plan) is dict and plan.get('schema') == 2
+    clarified = type(plan) is dict and plan.get('schema') == 3
+    keys = {'schema', 'mode', 'instruction', 'source_ref', 'task_base', 'request_id', 'candidates', 'sha256'}
+    if (type(plan) is not dict or set(plan) != keys | ({'source_refs'} if auto else {'clarification'} if clarified else set())
+            or type(plan['schema']) is not int or plan['schema'] not in (1, 2, 3) or plan['mode'] != 'capability'
+            or auto and plan['source_ref'] is not None
             or plan['sha256'] != approval
             or digest({key: value for key, value in plan.items() if key != 'sha256'}) != approval
             or plan['task_base'] != str(base)
@@ -113,6 +137,12 @@ def inspect_saved(run, *, task_base=TASK_BASE, computer_base=BASE):
             or re.fullmatch(r'[0-9a-f]{32}', plan['request_id']) is None):
         raise ComputerError('capability_saved_plan_invalid')
     _source(plan['source_ref'], base)
+    if auto:
+        from . import capability_source_choice as choice
+        choice.verify_refs(plan['source_refs'], base)
+    if clarified:
+        from .capability_clarification import verify
+        verify(plan, path, base, computer, require_claim=True)
     claim = read_record(path / 'claim.json')
     expected_task = base / ('task-' + plan['request_id'])
     if (type(claim) is not dict or claim != {'approval': approval,
@@ -124,10 +154,20 @@ def inspect_saved(run, *, task_base=TASK_BASE, computer_base=BASE):
     if outcome.get('before_start') is True:
         expected = {'ok': False, 'state': 'cancelled', 'code': 'capability_cancelled',
                     'artifacts': [], 'run': str(path), 'before_start': True}
+        if auto and outcome.get('code') == 'capability_source_ambiguous':
+            selected, proof = choice.checked(plan, path)
+            if selected is not None:
+                raise ComputerError('capability_source_choice_changed')
+            expected.update(state='needs_input', code='capability_source_ambiguous', source_selection_sha256=proof)
         if outcome != expected or expected_task.exists():
             raise ComputerError('capability_result_changed')
         return outcome
     current = _inspect(expected_task, base)
+    if auto:
+        choice.bind_result(plan, path, expected_task, current)
+    if clarified:
+        from .capability_source_choice import verify_task_source
+        verify_task_source(plan['source_ref'], expected_task, current)
     current.update(run=str(path), approval=approval)
     if outcome != current:
         raise ComputerError('capability_result_changed')
@@ -144,7 +184,16 @@ def execute(session, plan, *, approval, stop=lambda: False, task_base=TASK_BASE,
             or read_record(session.root / 'goals' / (approval + '.json')) != plan):
         raise ComputerError('capability_approval_invalid')
     _source(plan['source_ref'], base)
+    auto = plan.get('schema') == 2
+    if auto:
+        from . import capability_source_choice as choice
+        if plan['source_ref'] is not None:
+            raise ComputerError('capability_source_conflict')
+        choice.verify_refs(plan['source_refs'], base)
     run = safe_root(session.root / 'goals' / (approval + '.capability'))
+    if plan.get('schema') == 3:
+        from .capability_clarification import verify
+        verify(plan, run, base, session.root.parent)
     try:
         run.mkdir()
     except FileExistsError:
@@ -155,6 +204,9 @@ def execute(session, plan, *, approval, stop=lambda: False, task_base=TASK_BASE,
         return inspect_saved(run, task_base=base, computer_base=session.root.parent)
     task = base / ('task-' + plan['request_id'])
     write_new(run / 'claim.json', {'approval': approval, 'task_root': str(task)})
+    if plan.get('schema') == 3:
+        from .capability_clarification import claim
+        claim(plan, run, base, session.root.parent)
     if stop():
         value = {'ok': False, 'state': 'cancelled', 'code': 'capability_cancelled',
                  'artifacts': [], 'run': str(run), 'before_start': True}
@@ -163,6 +215,20 @@ def execute(session, plan, *, approval, stop=lambda: False, task_base=TASK_BASE,
     from .artifact_source import prepare_artifact_task_root
     from .assistant import run_task, TASK_SECONDS
     from .model import CloudClient
+    selected = client if client is not None else CloudClient(
+        deadline=time.monotonic() + TASK_SECONDS, should_stop=stop)
+    source_ref = plan['source_ref']
+    if auto:
+        source_ref, proof = choice.choose(plan, _SessionClient(selected, session, stop), run)
+        choice.verify_refs(plan['source_refs'], base)
+        if source_ref is None or stop():
+            value = {'ok': False, 'state': 'needs_input', 'code': 'capability_source_ambiguous',
+                     'artifacts': [], 'run': str(run), 'before_start': True, 'source_selection_sha256': proof}
+            if stop():
+                value = {'ok': False, 'state': 'cancelled', 'code': 'capability_cancelled',
+                         'artifacts': [], 'run': str(run), 'before_start': True}
+            write_new(run / 'outcome.json', value)
+            return value
     prepare_artifact_task_root(task, base)
     with (task / 'request.txt').open('x', encoding='utf-8') as stream:
         stream.write(plan['instruction'])
@@ -180,14 +246,17 @@ def execute(session, plan, *, approval, stop=lambda: False, task_base=TASK_BASE,
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     try:
-        selected = client if client is not None else CloudClient(
-            deadline=time.monotonic() + TASK_SECONDS, should_stop=stop)
-        _source(plan['source_ref'], base)
+        _source(source_ref, base)
         if stop():
             (task / 'cancel.flag').touch(exist_ok=True)
         (runner or run_task)(plan['instruction'], base, task_root=task,
-            client=_SessionClient(selected, session, stop), source_artifact=plan['source_ref'])
+            client=_SessionClient(selected, session, stop), source_artifact=source_ref)
         value = _inspect(task, base)
+        if auto:
+            choice.bind_result(plan, run, task, value)
+        if plan.get('schema') == 3:
+            from .capability_source_choice import verify_task_source
+            verify_task_source(plan['source_ref'], task, value)
         value.update(run=str(run), approval=approval)
         write_new(run / 'outcome.json', value)
         return value
@@ -212,9 +281,10 @@ def describe_result(result):
         'workbook_merged_unsupported': '工作簿包含当前资料读取器不支持的合并结构，不能完整读取；可使用保留版式的编辑入口，或开发该布局的适配器。',
         'workbook_merged_cells_unsupported': '工作簿含不支持的合并单元格，不能静默丢弃；需选择已有编辑能力或补充布局适配器。',
         'edited_table_totals_unsupported': '这份编辑后的表格包含合计或公式，当前复制技能不能完整保留；已停止，未静默丢掉合计行。需使用公式感知的工作簿适配器。',
-        'edited_table_scope_invalid': '修改涉及标题、表头或已支持表格范围之外；当前完整表格接力只支持数据区，需要扩展布局适配器。',
+        'edited_table_scope_invalid': '修改涉及标题、其他工作表或已支持表格范围之外；当前完整表格接力支持既有表头和数据区，需要扩展布局适配器。',
         'capability_previous_run_unknown': '此前执行已开始但没有完整结果回执；先核对原任务记录和文件，不能重新发出同一操作。',
-        'capability_cancelled': '任务已取消；开始前取消不会调用模型或操作文件。',
+        'capability_source_ambiguous': '无法仅凭文件名和格式确定一份输入，或任务需要多份联合处理。请明确输入成果，或使用批量自然语言编辑入口；尚未执行办公操作。',
+        'capability_cancelled': '任务已取消；尚未派发的办公操作不会执行，已发生的模型费用仍计入共享账本。',
         'session_model_call_limit': '本次电脑会话已达到六次模型调用上限；当前任务不再继续调用。',
         'model_budget_exceeded': '共享 API 预算不足；等待预算允许后再建立新任务，不能解除未知费用预留。',
         'skill_gate_invalid': '技能验证已失效；需重新测试、审查和实机验证后才能启用。',

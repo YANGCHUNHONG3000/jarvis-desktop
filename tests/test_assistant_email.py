@@ -3,7 +3,14 @@
 from hashlib import sha256
 from pathlib import Path
 
-from agent_service import assistant
+import pytest
+
+from agent_service import assistant, office_readiness
+
+
+@pytest.fixture(autouse=True)
+def offline_office_readiness(monkeypatch):
+    monkeypatch.setattr(office_readiness, "preflight_office_window", lambda: None)
 from agent_service.contracts import Observation
 from agent_service.research import run_research
 

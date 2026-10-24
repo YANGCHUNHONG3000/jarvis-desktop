@@ -1,5 +1,27 @@
 # Public snapshot checks
 
+## October 24, 2026 update
+
+The selected source contains 129 production/launcher Python files and 192 test
+files. The update adds natural-language routing previews, explicit historical
+Office batches, source clarification, Office readiness checks, guarded recovery,
+and verified artifact handoff. The ten desktop launchers remain the release scope.
+
+The latest development checkpoint passed 68 targeted tests. Real main-GUI
+acceptance selected a two-source table comparison from a natural-language task,
+created native WPS Excel/Word reports, automatically handed the new Word to a
+follow-up task, and verified another Excel/Word pair. All four outputs were read
+back; repeated routing reused its existing plan without a second model call.
+These are development-machine results, not tests rerun from the public snapshot.
+
+This synchronization does not rerun functional tests, native Office/browser
+operations or paid models. Release checks cover the selected source, Python
+syntax, dependency scope, exact staged files and publication exclusions. Private
+evidence, credentials, mail, captures, ledgers and the private Git history are not
+distributed. Fresh-machine setup and broader Office compatibility remain
+unverified; arbitrary Windows actions and general semantic multi-input tasks are
+outside the demonstrated scope. Earlier check results below remain historical.
+
 ## October 23, 2026 update
 
 This update contains 121 production/launcher Python files and 173 test files.

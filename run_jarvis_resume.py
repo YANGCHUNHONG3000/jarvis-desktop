@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import re
 
-from agent_service.office_resume import resume_task
+from agent_service.office_resume import resume_task as resume_office_task
 
 
 ROOT = Path(__file__).resolve().parent
@@ -28,12 +28,18 @@ def main(argv=None, *, execute=None, repo_root=None):
     parser.add_argument("--task-root", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--bundle", action="store_true",
+                        help="Use the reviewed joint Office recovery path")
     try:
         args = parser.parse_args(argv)
         if not Path(args.task_root).is_absolute():
             raise ValueError("task_root_invalid")
         repository = Path(repo_root).resolve() if repo_root is not None else ROOT
         base = repository / "data" / "assistant_tasks"
+        if args.bundle:
+            from agent_service.office_bundle_resume import resume_task
+        else:
+            resume_task = resume_office_task
         result = resume_task(args.task_root, base, args.token, args.attempt_id,
                              execute=execute)
     except KeyboardInterrupt:

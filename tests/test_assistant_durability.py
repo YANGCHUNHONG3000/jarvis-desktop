@@ -74,7 +74,7 @@ def test_successful_publication_is_valid_and_matches_result_event(tmp_path):
 
 
 def test_research_report_remains_visible_and_hash_checked_when_office_fails(tmp_path, monkeypatch):
-    from agent_service import office_host
+    from agent_service import office_host, office_readiness
 
     url = "https://example.org/evidence"
     excerpt = "The source says three tasks were completed."
@@ -93,6 +93,7 @@ def test_research_report_remains_visible_and_hash_checked_when_office_fails(tmp_
                 "application_verified": False}
 
     monkeypatch.setattr(office_host, "execute_office_supervised", failed_office)
+    monkeypatch.setattr(office_readiness, "preflight_office_window", lambda: None)
     plan = {"kind": "research", "query": "task evidence", "max_sources": 1,
             "office_formats": ["document"]}
     summary = {"title": "Summary", "claims": [{"text": "Three tasks were completed.",

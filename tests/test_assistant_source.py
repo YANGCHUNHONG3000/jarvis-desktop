@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from agent_service import assistant
+from agent_service import assistant, office_readiness
+
+
+@pytest.fixture(autouse=True)
+def offline_office_readiness(monkeypatch):
+    monkeypatch.setattr(office_readiness, "preflight_office_window", lambda: None)
 
 
 def _csv_source(path):

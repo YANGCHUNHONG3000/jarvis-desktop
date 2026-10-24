@@ -1,6 +1,7 @@
 """One approval for a bounded, reviewable cross-window plan."""
 import queue
 import threading
+from pathlib import Path
 
 from .computer import ComputerError, ComputerSession
 from .computer_goals import execute_goal, input_epoch, prepare_goal, propose_goal
@@ -17,6 +18,9 @@ NAMES = {'calculate': '计算并核对实际显示', 'read_text': '读取实际�
 
 
 def describe(plan):
+    if plan.get('mode') == 'office_bundle':
+        from .office_bundle import describe as describe_office_bundle
+        return describe_office_bundle(plan)
     if plan.get('mode') == 'capability':
         from .capability_router import describe as describe_capability
         return describe_capability(plan)
@@ -81,6 +85,14 @@ class GoalPanel:
         self.get_artifacts = lambda: []
         self.repository_readings = []
         self.capability_sources = []
+        self.capability_history_seed = None
+        self.capability_source_generation = 0
+        self.capability_sources_validated_generation = None
+        self.capability_preview_generation = None
+        self.daily_task_route_generation = 0
+        self.external_activity_seen = False
+        self.capability_source_label = tk.StringVar(value='来源：上一任务成果')
+        self.capability_clarification_window = None
         self.development_panel = None
         self.windows, self.controls, self.snapshots = [], [], {}
         self.running = self.closed = False
@@ -131,11 +143,30 @@ class GoalPanel:
         self.development_button.pack(side='left', padx=6)
         self.edit_adapter_button = ttk.Button(comparison_row, text='编辑适配器…', command=self.open_edit_adapter)
         self.edit_adapter_button.pack(side='left', padx=6)
+        capability_row = ttk.Frame(tab)
+        capability_row.pack(fill='x', pady=2)
+        self.capability_clarification_button = ttk.Button(
+            capability_row, text='明确来源后继续…', command=self.list_capability_clarifications,
+            state='disabled')
+        self.capability_clarification_button.pack(side='left')
+        self.office_bundle_button = ttk.Button(
+            capability_row, text='联合核对整批…', command=self.preview_office_bundle,
+            state='disabled')
+        self.office_bundle_button.pack(side='left', padx=6)
+        self.capability_previous_button = ttk.Button(
+            capability_row, text='改用上一任务成果', command=self.use_previous_task_artifacts,
+            state='disabled')
+        self.capability_previous_button.pack(side='left', padx=6)
+        self.daily_task_route_button = ttk.Button(
+            capability_row, text='按任务规划（云端）', command=self.propose_daily_task,
+            state='disabled')
+        self.daily_task_route_button.pack(side='left', padx=6)
+        ttk.Label(tab, textvariable=self.capability_source_label).pack(anchor='w')
         self.control_label = ttk.Label(tab, text='读取文字或选择项目时，选择来源控件')
         self.control_label.pack(anchor='w')
         self.control = ttk.Combobox(tab, state='readonly')
         self.control.pack(fill='x')
-        self.control.bind('<<ComboboxSelected>>', lambda _: self.invalidate())
+        self.control.bind('<<ComboboxSelected>>', self.capability_control_changed)
         self.text_label = ttk.Label(tab, text='新页文字（可留空使用默认文本）；云端规划时填写完整任务描述')
         self.text_label.pack(anchor='w')
         self.text = tk.Text(tab, height=3, wrap='word')
@@ -164,7 +195,14 @@ class GoalPanel:
         self.poll_id = root.after(100, self.poll)
 
     def mode_changed(self, _=None):
+        self.daily_task_route_generation += 1
+        self.capability_source_generation += 1
+        self.capability_sources_validated_generation = None
         self.invalidate(clear_snapshots=True)
+        if self.mode.get() == MODES[11] and self.capability_history_seed is not None:
+            self.capability_sources = []
+            self.control.configure(values=[])
+            self.update_office_bundle_button()
         adapter = self.mode.get() in MODES[4:]
         agent = self.mode.get() == MODES[6]
         interactive = self.mode.get() == MODES[7]
@@ -173,6 +211,12 @@ class GoalPanel:
         self.pause_checkbox.configure(state='disabled' if self.mode.get() == MODES[11] else 'normal')
         for widget in (self.comparison_source_button, self.comparison_reset_button):
             widget.configure(state='normal' if comparison and not self.running else 'disabled')
+        self.capability_clarification_button.configure(
+            state='normal' if self.mode.get() == MODES[11] and not self.running else 'disabled')
+        self.daily_task_route_button.configure(
+            state='normal' if self.mode.get() == MODES[11] and not self.running
+            and not self.external_busy() else 'disabled')
+        self.update_office_bundle_button()
         search = self.mode.get() in MODES[5:]
         self.expression_label.configure(text='文档标题（可留空使用主题，最多 200 字）' if search else '公开网页链接（最多 2 个，用空格分隔）' if adapter else '计算式（例如 12.5*4）；支持两个数的加减乘除')
         self.text_label.configure(text='检索主题；可选云端规划时填写完整任务描述（仅上传这里的文字）' if search else '文档标题／摘录主题（1～200 字）' if adapter else '新页文字（可留空使用默认文本）；云端规划时填写完整任务描述')
@@ -214,28 +258,215 @@ class GoalPanel:
         if self.mode.get() == MODES[11]:
             self.expression_label.configure(text='无需填写标题或指定技能名称。')
             self.text_label.configure(text='完整任务说明（自动核对已有技能；只生成新文件）')
-            self.control_label.configure(text='上一任务成果（无需重新找文件；一次处理一份，批量修改使用自然语言编辑模式）')
+            self.control_label.configure(text='上一任务成果（默认按任务选择一份输入；多文件联合修改使用自然语言编辑模式）')
             self.propose_button.configure(state='disabled')
             self.refresh_capability_sources()
 
     def refresh_capability_sources(self):
         if self.running or self.external_busy():
             return
-        records = self.get_artifacts()
+        from copy import deepcopy
+        self.capability_source_generation += 1
+        generation = self.capability_source_generation
+        self.capability_sources_validated_generation = None
+        seed = deepcopy(self.capability_history_seed)
+        records = deepcopy(seed['records']) if seed else self.get_artifacts()
+        identity = seed['task_id'] if seed else None
         def work(_):
             from .office_handoff import latest_generated_outputs, select_outputs
             selected = records or latest_generated_outputs(stop=self.stopped.is_set)
-            return select_outputs(selected) if selected else []
+            refs = select_outputs(selected) if selected else []
+            return {'generation': generation, 'refs': refs, 'task_id': identity}
+        if seed:
+            names = '、'.join(Path(item['path']).name for item in records)
+            self.capability_source_label.set(f"来源：历史任务 {identity}（{names}）")
+        else:
+            self.capability_source_label.set('来源：上一任务成果')
+        self.capability_previous_button.configure(
+            state='normal' if seed and self.mode.get() == MODES[11] else 'disabled')
         self.start('capability_sources', work)
 
+    def use_history_artifact_batch(self, task_id, records, is_current):
+        """Pin one inspected history task as the explicit capability source batch."""
+        if self.running or self.external_busy() or self.closed or not is_current():
+            return False
+        from copy import deepcopy
+        records = deepcopy(records)
+        if not isinstance(task_id, str) or not 2 <= len(records) <= 4:
+            self.status.set('历史批次必须包含同一任务的 2 至 4 份 Word/Excel 成果。')
+            return False
+        if any(type(item) is not dict or not isinstance(item.get('path'), str)
+               or Path(item['path']).suffix.lower() not in {'.docx', '.xlsx'}
+               or not isinstance(item.get('sha256'), str) for item in records):
+            self.status.set('历史批次成果信息不完整，未接入。')
+            return False
+        self.capability_history_seed = {
+            'task_id': task_id, 'records': records, 'is_current': is_current}
+        self.capability_sources = []
+        self.capability_source_generation += 1
+        self.capability_sources_validated_generation = None
+        self.invalidate()
+        self.mode.set(MODES[11])
+        self.mode_changed()
+        self.status.set(f'正在重新核验历史任务 {task_id} 的整批来源；未调用模型或启动 Office。')
+        return True
+
+    def use_previous_task_artifacts(self):
+        if self.running or self.external_busy() or self.closed:
+            return
+        self.capability_history_seed = None
+        self.capability_sources = []
+        self.capability_source_generation += 1
+        self.capability_sources_validated_generation = None
+        self.invalidate()
+        self.capability_source_label.set('来源：上一任务成果')
+        self.status.set('已清除历史批次；正在重新核验上一任务成果。')
+        if self.mode.get() == MODES[11]:
+            self.refresh_capability_sources()
+
+    def capability_control_changed(self, _=None):
+        self.daily_task_route_generation += 1
+        self.capability_preview_generation = None
+        self.invalidate()
+
+    def propose_daily_task(self):
+        """Ask the bounded daily-task router to select an existing plan."""
+        if (self.running or self.external_busy() or self.closed
+                or self.mode.get() != MODES[11]):
+            return
+        instruction = self.text.get('1.0', 'end-1c').strip()
+        if not instruction:
+            self.invalidate()
+            self.status.set('请先填写完整任务说明，再按任务规划。')
+            return
+        if not self._history_source_is_validated():
+            self.invalidate()
+            self.status.set('来源绑定已失效；请重新核验来源后再规划。')
+            return
+        if self.capability_sources_validated_generation != self.capability_source_generation:
+            self.invalidate()
+            self.status.set('来源尚未完成本地核验；等待核验完成后再规划。')
+            return
+        index = self.control.current()
+        refs = self.capability_sources
+        if index == 0:
+            selected_refs = refs
+        elif index == 1:
+            selected_refs = []
+        elif 2 <= index < len(refs) + 2:
+            selected_refs = [refs[index - 2]]
+        else:
+            self.invalidate()
+            self.status.set('请明确选择自动按任务选择、单个来源或无来源。')
+            return
+        if index == 0 and not refs:
+            self.invalidate()
+            self.status.set('没有可用来源；请明确选择“无来源文件”后再规划。')
+            return
+        from copy import deepcopy
+        self.daily_task_route_generation += 1
+        token = {
+            'generation': self.daily_task_route_generation,
+            'source_generation': self.capability_source_generation,
+            'control_index': index,
+            'preview_generation': self.capability_preview_generation,
+            'instruction': instruction,
+            'history_task_id': (self.capability_history_seed or {}).get('task_id'),
+        }
+        source_refs = deepcopy(selected_refs)
+        self.invalidate()
+
+        def work(session):
+            from .daily_task_routing import propose
+            result = propose(session, instruction, source_refs, stop=self.stopped.is_set)
+            return {'token': token, 'result': result}
+
+        self.start('daily_task_route', work)
+
+    def _history_seed_is_current(self):
+        seed = self.capability_history_seed
+        return seed is None or bool(seed['is_current']())
+
+    def _history_source_is_validated(self):
+        seed = self.capability_history_seed
+        return (seed is None or
+                self.capability_sources_validated_generation == self.capability_source_generation
+                and self._history_seed_is_current())
+
+    def invalidate_history_batch_source(self, reason='历史来源已变化，请重新选择并核验批次。'):
+        """Invalidate an inspected history batch without silently replacing its seed."""
+        if self.capability_history_seed is None:
+            return
+        self.capability_source_generation += 1
+        self.capability_sources_validated_generation = None
+        self.capability_sources = []
+        self.capability_preview_generation = None
+        self.control.configure(values=['自动按任务选择输入', '无来源文件'])
+        self.control.current(0)
+        self.invalidate()
+        self.update_office_bundle_button()
+        self.status.set(reason)
+
+    def notify_external_activity(self, active=True, *, force=False):
+        """Invalidate approvals and source checks once when another task starts."""
+        if not active:
+            self.external_activity_seen = False
+            return
+        if self.external_activity_seen and not force:
+            return
+        self.external_activity_seen = True
+        self.capability_source_generation += 1
+        self.capability_sources_validated_generation = None
+        self.capability_sources = []
+        if self.mode.get() == MODES[11]:
+            self.control.configure(values=['自动按任务选择输入', '无来源文件'])
+            self.control.current(0)
+            self.update_office_bundle_button()
+        self.capability_preview_generation = None
+        self.invalidate()
+        self.status.set('其他任务已开始；旧预览和来源检查已失效。请重新核验来源后再预览。')
+
+    def update_office_bundle_button(self):
+        enabled = (self.mode.get() == MODES[11] and not self.running
+                   and not self.external_busy() and 2 <= len(self.capability_sources) <= 4)
+        self.office_bundle_button.configure(state='normal' if enabled else 'disabled')
+
+    def preview_office_bundle(self):
+        if (self.running or self.external_busy() or self.closed
+                or self.mode.get() != MODES[11]):
+            return
+        if not self._history_source_is_validated():
+            self.invalidate()
+            self.status.set('历史批次绑定已失效；请重新选择并核验历史来源后再预览。')
+            return
+        from copy import deepcopy
+        if not 2 <= len(self.capability_sources) <= 4:
+            self.status.set('联合核对需要 2 至 4 份已核验 Office 成果。')
+            return
+        from .office_bundle import prepare
+        instruction = self.text.get('1.0', 'end-1c').strip()
+        refs = deepcopy(self.capability_sources)
+        self.capability_preview_generation = self.capability_source_generation
+        self.invalidate()
+        self.start('office_bundle_preview', lambda s: prepare(s, instruction, refs))
+
     def preview_capability(self, instruction):
+        if not self._history_source_is_validated():
+            self.invalidate()
+            self.status.set('历史批次绑定已失效；请重新选择并核验历史来源后再预览。')
+            return
         from .capability_router import prepare
         index = self.control.current()
-        if not 0 <= index <= len(self.capability_sources):
+        if not 0 <= index <= len(self.capability_sources) + 1:
             raise ComputerError('请先选择来源或明确选择无来源')
-        ref = self.capability_sources[index - 1] if index else None
+        if index == 0 and not self.capability_sources:
+            raise ComputerError('没有可用的上一任务成果；请明确选择无来源，或先接入成果')
+        from copy import deepcopy
+        options = ({'source_refs': deepcopy(self.capability_sources)} if index == 0 else
+                   {'source_ref': deepcopy(self.capability_sources[index - 2]) if index > 1 else None})
+        self.capability_preview_generation = self.capability_source_generation
         self.invalidate()
-        self.start('capability_preview', lambda s: prepare(s, instruction, source_ref=ref))
+        self.start('capability_preview', lambda s: prepare(s, instruction, **options))
 
     def configure_comparison(self):
         if self.running or self.external_busy():
@@ -271,7 +502,9 @@ class GoalPanel:
         self.comparison_source = self.comparison_goal = self.comparison_fields = None
         self.comparison_recovery = False
         self.invalidate()
-        self.start('comparison_source', lambda _: select_source(run, stop=self.stopped.is_set))
+        self.start('comparison_source', lambda _: select_source(
+            run, stop=self.stopped.is_set,
+            progress=lambda message: self.messages.put(('comparison_progress', message, None))))
 
     def reset_comparison_source(self):
         if self.running or self.external_busy():
@@ -401,6 +634,15 @@ class GoalPanel:
         self.development_button.configure(state='disabled' if value else 'normal')
         for widget in (self.comparison_source_button, self.comparison_reset_button):
             widget.configure(state='normal' if not value and self.mode.get() == MODES[10] else 'disabled')
+        self.capability_clarification_button.configure(
+            state='normal' if not value and self.mode.get() == MODES[11] else 'disabled')
+        self.daily_task_route_button.configure(
+            state='normal' if not value and not self.external_busy()
+            and self.mode.get() == MODES[11] else 'disabled')
+        self.capability_previous_button.configure(
+            state='normal' if not value and self.mode.get() == MODES[11]
+            and self.capability_history_seed is not None else 'disabled')
+        self.update_office_bundle_button()
         self.interaction_button.configure(state='normal' if not value and self.mode.get()==MODES[7] else 'disabled')
         if not value and self.mode.get() in (MODES[9], MODES[10]):
             self.interaction_button.configure(state='normal')
@@ -499,7 +741,8 @@ class GoalPanel:
                     instruction = text.strip() or goal['title']
                     self.invalidate()
                     self.start('comparison_preview', lambda s: prepare_selected(
-                        s, instruction, goal, selection, stop=self.stopped.is_set))
+                        s, instruction, goal, selection, stop=self.stopped.is_set,
+                        progress=lambda message: self.messages.put(('comparison_progress', message, None))))
                     return
                 self.show_plan(prepare(self.session, text.strip() or self.comparison_goal['title'],
                                        self.comparison_goal))
@@ -577,6 +820,87 @@ class GoalPanel:
         self.show_text(describe(plan) if plan else '当前目标不在已支持范围内。')
         self.execute_button.configure(state='normal' if plan else 'disabled')
 
+    def list_capability_clarifications(self):
+        if (self.running or self.external_busy() or self.closed
+                or self.mode.get() != MODES[11]):
+            return
+        from .capability_clarification import pending
+        self.invalidate()
+        self.start('capability_clarifications', lambda _: pending())
+
+    def open_capability_clarification_selector(self, records):
+        if (self.closed or self.running or self.external_busy()
+                or self.mode.get() != MODES[11]):
+            return
+        if not records:
+            self.status.set('没有可明确来源的待处理任务；未知执行结果不会出现在此列表。')
+            return
+        import tkinter as tk
+        from tkinter import ttk
+        from .office_scope_panel import _modal
+        from copy import deepcopy
+        rows = deepcopy(records)
+        win, close = _modal(self.root, '明确来源后继续', '780x440')
+        self.capability_clarification_window = win
+        ttk.Label(win, text='选择一个已核验的来源不明确任务，再选择一份已批准来源。此操作只准备新预览，不执行办公步骤。',
+                  wraplength=740).pack(fill='x', padx=12, pady=8)
+        box = tk.Listbox(win, exportselection=False, height=8)
+        box.pack(fill='both', expand=True, padx=12)
+        for row in rows:
+            box.insert(tk.END, row['instruction'][:120] + ' · ' + row['run'])
+        ttk.Label(win, text='选择输入成果').pack(anchor='w', padx=12, pady=(8, 2))
+        source = ttk.Combobox(win, state='readonly')
+        source.pack(fill='x', padx=12)
+        status = tk.StringVar(value='待处理记录来自已核验且尚未派发的任务；旧尝试保留。')
+        ttk.Label(win, textvariable=status, wraplength=740).pack(fill='x', padx=12, pady=8)
+        selected_row = {'index': None}
+
+        def changed(_event=None):
+            selection = box.curselection()
+            selected_row['index'] = selection[0] if selection else None
+            row = rows[selected_row['index']] if selected_row['index'] is not None else None
+            values = [f"{item['id']} · {item['filename']} ({item['format']})"
+                      for item in row['sources']] if row else []
+            source.configure(values=values)
+            source.current(0 if values else -1)
+            accept.configure(state='normal' if values else 'disabled')
+            status.set(row['instruction'] if row else '请选择待处理任务。')
+
+        def choose():
+            index = selected_row['index']
+            if index is None or not 0 <= index < len(rows):
+                return
+            row = rows[index]
+            source_index = source.current()
+            if not 0 <= source_index < len(row['sources']):
+                return
+            source_id = row['sources'][source_index]['id']
+            close()
+            self.capability_clarification_window = None
+            if (self.closed or self.running or self.external_busy()
+                    or self.mode.get() != MODES[11]):
+                return
+            from .capability_clarification import prepare
+            self.prepare_capability_clarification(row['run'], source_id)
+
+        accept = ttk.Button(win, text='准备新的来源绑定预览', command=choose, state='disabled')
+        accept.pack(pady=10)
+        box.bind('<<ListboxSelect>>', changed)
+
+        def dismiss():
+            self.capability_clarification_window = None
+            close()
+        win.protocol('WM_DELETE_WINDOW', dismiss)
+
+    def prepare_capability_clarification(self, run, source_id):
+        if (self.closed or self.running or self.external_busy()
+                or self.mode.get() != MODES[11]):
+            return
+        from .capability_clarification import prepare
+        self.invalidate()
+        self.start('capability_clarification_prepare',
+                   lambda session: prepare(session, run, source_id))
+
     def list_recoveries(self):
         if self.running or self.external_busy():
             return
@@ -653,12 +977,24 @@ class GoalPanel:
     def execute(self):
         if self.running or self.external_busy() or self.plan is None:
             return
+        if (self.plan.get('mode') in {'capability', 'office_bundle'}
+                and not self._history_source_is_validated()):
+            self.invalidate()
+            self.status.set('来源绑定已失效；旧预览不能执行，请重新核验来源并预览。')
+            return
         if self.plan.get('mode') == 'capability':
             from .capability_router import execute
             plan = self.plan
             self.invalidate()
             self.start('capability_execute', lambda s: execute(s, plan,
                 approval=plan['sha256'], stop=self.stopped.is_set))
+            return
+        if self.plan.get('mode') == 'office_bundle':
+            from .office_bundle import execute
+            plan = self.plan
+            self.invalidate()
+            self.start('office_bundle_execute', lambda s: execute(
+                s, plan, approval=plan['sha256'], stop=self.stopped.is_set))
             return
         if self.plan.get('mode') == 'repository_document':
             from .repository_document import execute_repository_document
@@ -747,6 +1083,8 @@ class GoalPanel:
         self.human_continue_button.configure(state='disabled')
 
     def stop(self):
+        self.capability_source_generation += 1
+        self.daily_task_route_generation += 1
         self.stopped.set()
         if self.development_panel and self.development_panel.running:
             self.development_panel.stop_event.set()
@@ -755,8 +1093,11 @@ class GoalPanel:
         self.status.set('已请求停止；已完成的操作会保留，不会重放或回滚。')
 
     def close(self):
+        self.capability_source_generation += 1
+        self.daily_task_route_generation += 1
         self.closed = True
         self.stopped.set()
+        self.invalidate(True)
         if self.development_panel and not self.development_panel.closed:
             self.development_panel.stop_event.set()
             self.development_panel.close()
@@ -771,6 +1112,10 @@ class GoalPanel:
             self.poll_id = None
         if self.closed:
             return
+        if self.external_busy() and not self.running:
+            self.notify_external_activity(True)
+        elif not self.external_busy() and self.external_activity_seen:
+            self.notify_external_activity(False)
         try:
             while True:
                 kind, result, error = self.messages.get_nowait()
@@ -801,7 +1146,13 @@ class GoalPanel:
                     finally:
                         event.set()
                     continue
+                if kind == 'comparison_progress':
+                    if self.running and not self.stopped.is_set():
+                        self.status.set(result + ' 可停止。')
+                    continue
                 if kind == 'progress':
+                    if self.stopped.is_set():
+                        continue
                     if result.get('op') in {'agent_cycle','agent_reobserve','repository_document','page_office'}:
                         self.status.set(result['message'] + ' 可停止。')
                         continue
@@ -819,6 +1170,9 @@ class GoalPanel:
                     detail = describe_result(result)
                     self.show_text(detail + '\n记录：' + result['run'])
                     self.status.set('产物已通过回读核验，请核对任务要求。' if result['ok'] else '任务未完成，原因与下一步见上方。')
+                    if result.get('code') == 'capability_source_ambiguous':
+                        self.status.set('作用尚未开始；可点击“明确来源后继续…”选择一份输入并生成新的预览。旧记录保留。')
+                        self.show_text(detail + '\n\n可点击“明确来源后继续…”选择已核验输入，生成新的批准预览。原尝试保留，未知执行不会列入继续列表。\n记录：' + result['run'])
                     if result['ok'] and result.get('artifacts'):
                         try:
                             self.on_artifacts(result['artifacts'])
@@ -826,6 +1180,25 @@ class GoalPanel:
                         except Exception:
                             self.show_text(detail + '\n成果已保存，但自动接力未完成。\n记录：' + result['run'])
                             self.status.set('成果已保存，自动接力未完成；可从历史任务重新选用。')
+                elif kind == 'office_bundle_execute' and result:
+                    from .office_bundle import describe_result
+                    self.invalidate(True)
+                    detail = describe_result(result)
+                    self.show_text(detail + ('\n记录：' + str(result['run']) if result.get('run') else ''))
+                    if result.get('ok'):
+                        if self.stopped.is_set() or self.closed:
+                            self.status.set('联合核对成果已通过核验并保留；已停止或面板已关闭，未自动接力。')
+                        else:
+                            self.status.set('联合核对成果已通过核验。')
+                        if result.get('artifacts') and not self.stopped.is_set() and not self.closed:
+                            try:
+                                self.on_artifacts(result['artifacts'])
+                                self.show_text(detail + '\nOffice 成果已自动接入下一任务。\n记录：' + str(result.get('run', '')))
+                            except Exception:
+                                self.status.set('成果已保存，自动接力未完成；可从历史任务重新选用。')
+                    else:
+                        code = result.get('code', 'office_bundle_failed')
+                        self.status.set('联合核对未完成：' + code + '；未知结果不会自动重跑。')
                 elif kind == 'repository_document' and result:
                     self.invalidate(True)
                     if result['ok']:
@@ -887,7 +1260,13 @@ class GoalPanel:
                             dimensions=result.get('comparison_dimensions', ())) + '\n记录：' + result['run'])
                 elif error or self.stopped.is_set():
                     self.invalidate(True)
-                    if error in {'comparison_seed_invalid', 'comparison_seed_changed'}:
+                    if kind == 'office_bundle_execute':
+                        reason = error or '已停止，结果可能未知'
+                        self.status.set('联合核对未完成：' + reason + '；不会自动重试，请重新核验来源与记录。')
+                        self.show_text(self.status.get())
+                    elif error == 'comparison_selection_cancelled':
+                        self.status.set('已停止历史来源核验；旧任务和成果已保留。可重新选择来源或本地预览。')
+                    elif error in {'comparison_seed_invalid', 'comparison_seed_changed'}:
                         self.comparison_source = self.comparison_goal = self.comparison_fields = None
                         self.status.set('历史来源核验未通过：文件已变化、证据不完整或接力层级不支持。未重跑旧步骤；请另选来源。')
                     elif error and error.startswith('edit_adapter_'):
@@ -895,14 +1274,92 @@ class GoalPanel:
                     else:
                         self.status.set('未完成：' + (error or '已停止') + '。需要重新读取和预览。')
                 elif kind == 'capability_sources':
-                    self.capability_sources = result
-                    self.control.configure(state='readonly', values=['无来源文件'] +
-                        [f"{n}. {ref['artifact']}" for n, ref in enumerate(result, 1)])
-                    self.control.current(len(result) if result else 0)
-                    self.status.set('已自动带入上一任务成果；确认所选来源并填写完整任务，先本地预览。')
+                    if (type(result) is not dict
+                            or result.get('generation') != self.capability_source_generation
+                            or self.mode.get() != MODES[11] or self.closed
+                            or (self.external_busy() and not self.running)
+                            or (self.capability_history_seed is not None and
+                                (result.get('task_id') != self.capability_history_seed['task_id']
+                                 or not self.capability_history_seed['is_current']()))):
+                        continue
+                    refs = result.get('refs')
+                    if not isinstance(refs, list):
+                        refs = []
+                    self.capability_sources = refs
+                    self.capability_sources_validated_generation = result['generation']
+                    self.control.configure(state='readonly', values=['自动按任务选择输入', '无来源文件'] +
+                        [f"{n}. {ref['artifact']}" for n, ref in enumerate(refs, 1)])
+                    self.control.current(0 if refs else 1)
+                    self.update_office_bundle_button()
+                    if self.capability_history_seed is not None:
+                        names = '、'.join(Path(item['path']).name
+                                          for item in self.capability_history_seed['records'])
+                        self.capability_source_label.set(
+                            f"来源：历史任务 {self.capability_history_seed['task_id']}（{names}）")
+                        self.status.set(f'历史批次已核验并整批保留：{names}。填写任务后先本地预览；预览仍需批准。')
+                    else:
+                        self.capability_source_label.set('来源：上一任务成果')
+                        self.status.set('已带入上一任务成果；填写完整任务，先本地预览。批准后选择输入，无法确定时会提示。')
+                elif kind == 'capability_clarifications':
+                    if self.mode.get() == MODES[11] and not self.closed:
+                        self.open_capability_clarification_selector(result)
+                elif kind == 'capability_clarification_prepare':
+                    if self.mode.get() == MODES[11] and not self.closed:
+                        self.show_plan(result)
+                        self.status.set('来源已重新核验并绑定到新计划。请检查原任务和输入，再点击批准；尚未执行办公步骤。')
                 elif kind == 'capability_preview':
+                    if (self.mode.get() != MODES[11]
+                            or self.capability_preview_generation != self.capability_source_generation
+                            or not self._history_source_is_validated()):
+                        self.invalidate()
+                        self.status.set('来源已变化；旧能力预览已丢弃，请重新核验并预览。')
+                        continue
                     self.show_plan(result)
                     self.status.set('本地预览完成；批准后再调用模型匹配技能或现有适配器。')
+                elif kind == 'daily_task_route':
+                    if type(result) is not dict or type(result.get('token')) is not dict:
+                        continue
+                    token = result['token']
+                    if (self.mode.get() != MODES[11] or self.closed or self.stopped.is_set()
+                            or self.running
+                            or self.daily_task_route_generation != token.get('generation')
+                            or self.capability_source_generation != token.get('source_generation')
+                            or self.control.current() != token.get('control_index')
+                            or self.capability_preview_generation != token.get('preview_generation')
+                            or self.text.get('1.0', 'end-1c').strip() != token.get('instruction')
+                            or (self.capability_history_seed or {}).get('task_id') != token.get('history_task_id')
+                            or not self._history_source_is_validated()
+                            or self.capability_sources_validated_generation != self.capability_source_generation):
+                        continue
+                    routed = result.get('result')
+                    if type(routed) is not dict:
+                        self.invalidate()
+                        self.status.set('任务路由返回格式无效；未生成可批准计划。')
+                        continue
+                    state = routed.get('state')
+                    if state == 'ready' and isinstance(routed.get('plan'), dict):
+                        self.show_plan(routed['plan'])
+                        reason = routed.get('reason') or '已选择适用的现有能力。'
+                        self.status.set('已选择：' + str(reason)
+                                        + ' 请检查来源和完整计划后批准。')
+                    elif state in {'needs_input', 'blocked'}:
+                        self.invalidate()
+                        message = routed.get('reason') or ('需要补充任务信息。' if state == 'needs_input'
+                                                           else '当前任务超出已支持范围。')
+                        self.show_text(str(message))
+                        self.status.set(str(message))
+                    else:
+                        self.invalidate()
+                        self.status.set('任务路由未提供可批准计划；请修改任务说明后重试。')
+                elif kind == 'office_bundle_preview':
+                    if (self.mode.get() != MODES[11]
+                            or self.capability_preview_generation != self.capability_source_generation
+                            or not self._history_source_is_validated()):
+                        self.invalidate()
+                        self.status.set('来源已变化；旧联合核对预览已丢弃，请重新核验并预览。')
+                        continue
+                    self.show_plan(result)
+                    self.status.set('联合核对预览完成；请检查全部来源与输出范围，再点击批准。')
                 elif kind == 'generated_artifacts':
                     self.use_generated_artifacts(result)
                 elif kind == 'comparison_candidates':

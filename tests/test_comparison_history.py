@@ -76,17 +76,20 @@ def test_select_source_rebuilds_editable_v3_goal_and_respects_cancel(monkeypatch
 
 def test_select_source_cancel_after_verification_discards_result(monkeypatch):
     from agent_service import comparison_seed
+    from threading import Event
+    stopped = Event()
     goal = _goal()
     manifest = {'run': 'original', 'queries': goal['queries'], 'source_ids': ['a' * 24]}
     monkeypatch.setattr(comparison_seed, 'create_manifest', lambda run: manifest)
-    monkeypatch.setattr(comparison_seed, 'load_seed', lambda value: [
-        ({'url': 'https://a.example/page', 'query_index': 0}, {})])
+    def finish_verification(value):
+        stopped.set()
+        return [({'url': 'https://a.example/page', 'query_index': 0}, {})]
+    monkeypatch.setattr(comparison_seed, 'load_seed', finish_verification)
     monkeypatch.setattr(history, 'safe_root', lambda run: type('Root', (), {
         'with_suffix': lambda self, suffix: 'source-plan.json'})())
     monkeypatch.setattr(history, 'read_record', lambda path: {'goal': goal})
-    checks = iter([False, True])
     with pytest.raises(ComputerError, match='comparison_selection_cancelled'):
-        history.select_source('original', stop=lambda: next(checks))
+        history.select_source('original', stop=stopped.is_set)
 
 
 def test_prepare_selected_rejects_changed_source_before_writing_plan(monkeypatch):
@@ -126,14 +129,17 @@ def test_prepare_selected_passes_original_selection_and_rejects_reblessing(monke
 
 def test_prepare_selected_cancel_after_plan_does_not_return_approval(monkeypatch):
     from agent_service import comparison_seed, comparison_crosssite
+    from threading import Event
+    stopped = Event()
     manifest = {'run': 'old', 'source_ids': ['a' * 24], 'queries': _goal()['queries']}
     monkeypatch.setattr(comparison_seed, 'load_seed', lambda value: None)
-    monkeypatch.setattr(comparison_crosssite, 'prepare_followup', lambda *args: {
-        'goal': {'comparison': {'seed': manifest}}})
-    checks = iter([False, True])
+    def finish_plan(*args):
+        stopped.set()
+        return {'goal': {'comparison': {'seed': manifest}}}
+    monkeypatch.setattr(comparison_crosssite, 'prepare_followup', finish_plan)
     with pytest.raises(ComputerError, match='comparison_selection_cancelled'):
         history.prepare_selected(object(), 'new task', _goal(), {'manifest': manifest},
-                                 stop=lambda: next(checks))
+                                 stop=stopped.is_set)
 
 
 def test_recent_candidates_includes_bounded_ordinary_research(tmp_path):
@@ -201,3 +207,55 @@ def test_metadata_lists_compact_capable_failures_without_claiming_verification(t
         'code': 'agent_no_safe_next_action'}), encoding='utf8')
     assert history.recent_candidates(base=tmp_path) == [
         {'run': str(root), 'title': '缺证', 'kind': 'comparison_failed'}]
+
+
+def _recovered_plan():
+    goal = _goal()
+    goal['comparison'].update(evidence_version=4, seed={'version': 2})
+    return {'goal': goal, 'recovery': {'kind': 'research', 'version': 2, 'depth': 1}}
+
+
+def test_metadata_lists_supported_first_completed_comparison_recovery(tmp_path):
+    root = _run(tmp_path, 1, 1)
+    root.with_suffix('.json').write_text(json.dumps(_recovered_plan()), encoding='utf8')
+    assert history.recent_candidates(base=tmp_path) == [
+        {'run': str(root), 'title': '原题', 'kind': 'comparison_recovered'}]
+
+
+@pytest.mark.parametrize('target,key,value', [
+    ('recovery', 'kind', 'comparison'), ('recovery', 'version', True),
+    ('recovery', 'version', 2.0), ('recovery', 'depth', True),
+    ('recovery', 'depth', 1.0), ('recovery', 'depth', 2),
+    ('comparison', 'evidence_version', True), ('comparison', 'evidence_version', 4.0),
+    ('comparison', 'evidence_version', 3), ('comparison', 'seed', None),
+    ('seed', 'version', True), ('seed', 'version', 2.0),
+    ('seed', 'version', 4), ('seed', 'version', 5),
+])
+def test_metadata_rejects_unsupported_completed_comparison_recovery(tmp_path, target, key, value):
+    root = _run(tmp_path, 1, 1)
+    plan = _recovered_plan()
+    node = (plan['recovery'] if target == 'recovery' else plan['goal']['comparison']
+            if target == 'comparison' else plan['goal']['comparison']['seed'])
+    node[key] = value
+    root.with_suffix('.json').write_text(json.dumps(plan), encoding='utf8')
+    assert history.recent_candidates(base=tmp_path) == []
+
+
+def test_recovered_source_selection_rebuilds_scope_without_recovery_plan(monkeypatch):
+    from agent_service import comparison_seed, comparison_crosssite
+    plan = _recovered_plan()
+    manifest = {'version': 3, 'run': 'original', 'queries': plan['goal']['queries'],
+                'source_ids': ['a' * 24]}
+    monkeypatch.setattr(comparison_crosssite, 'followup_manifest', lambda run: deepcopy(manifest))
+    monkeypatch.setattr(comparison_seed, 'load_seed', lambda value: [
+        ({'url': 'https://a.example/page', 'query_index': 0}, {})])
+    monkeypatch.setattr(history, 'safe_root', lambda run: type('Root', (), {
+        'with_suffix': lambda self, suffix: 'source-plan.json'})())
+    monkeypatch.setattr(history, 'read_record', lambda path: deepcopy(plan))
+    selected = history.select_source('original')
+    assert selected['manifest'] == manifest
+    assert selected['goal']['queries'] == manifest['queries']
+    assert selected['goal']['comparison']['evidence_version'] == 3
+    assert 'seed' not in selected['goal']['comparison'] and 'recovery' not in selected['goal']
+    description = history.source_description(selected)
+    assert '首次恢复对比的已核验捕获' in description and '旧结论不沿用' in description

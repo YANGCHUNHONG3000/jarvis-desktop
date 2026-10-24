@@ -301,6 +301,21 @@ def _audit_review_coverage(recipe, manifest, snapshot, steps):
     return coverage
 
 
+def _literal_table_review_coverage(snapshot, steps):
+    """Bind a full-table recipe to its verified input without sending rows twice."""
+    from .office_workflow import _hash
+    observed = snapshot['observed']
+    first = steps[0]
+    if (snapshot['kind'] != 'table' or first.get('action') != 'spreadsheet'
+            or _hash(observed) != _hash({key: first.get('data', {}).get(key)
+                                       for key in ('headers', 'rows')})):
+        raise AssistantError('skill_source_projection_mismatch')
+    return {'source_sha256': snapshot['sha256'], 'table_sha256': _hash(observed),
+            'source_headers': observed['headers'],
+            'source_row_count': len(observed['rows']), 'source_column_count': len(observed['headers']),
+            'all_source_retained': True, 'plan_step': first['id'], 'layout_preserved': False}
+
+
 def _synthesis(value, observations):
     _object(value, {"title", "claims"}, {"limitations"})
     _string(value["title"], 1, 200)
@@ -918,6 +933,8 @@ def run_task(instruction: str, root: Path, *, client=None, research=run_research
                            and item["sha256"] == plan["sha256"]), None)
             if chosen is None:
                 raise AssistantError("skill_selection_stale")
+            if chosen['recipe'] in {'table_copy', 'table_report'}:
+                review_data['source_table_coverage'] = _literal_table_review_coverage(source_snapshot, steps)
             if chosen["recipe"] in {"workbook_audit_report", "document_structure_report"}:
                 from .local_skills import _prepared_snapshot, _store, _version
                 if _prepared_snapshot(task_root, source_snapshot, base) != source_snapshot:
@@ -959,6 +976,10 @@ def run_task(instruction: str, root: Path, *, client=None, research=run_research
                 'The all_source_retained flag is based on exact equality between the fixed output table rows '
                 'and the complete verified source projection. Do not invent additional source sheets, hidden '
                 'sheets, cells or Word records. Reject if the user requested executable formulas or original layout. '
+                'For source_table_coverage, exact typed equality of ALL source headers and rows has been checked '
+                'against the referenced proposed_steps table. That plan table IS the complete source data; '
+                'do not invent missing columns, quotes or different source values. This does not approve extra '
+                'effects: still check requested titles, files, sums and drafts against the USER instruction. '
                 'Approval is not allowed just because the source kind or a keyword matches.',
                 review_input, max_tokens=512)
             _object(verdict, {"approved", "reason"})

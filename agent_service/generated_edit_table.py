@@ -43,14 +43,15 @@ def _apply_changes(observed, changes, sheet_name):
         for letter in match.group(1):
             column = column * 26 + ord(letter) - 64
         row = int(match.group(2))
-        # Row 1 is the merged title; row 2 is the header. Formula totals are
-        # excluded by the creation source contract. Only data cells transfer.
-        if not 1 <= column <= width or not 3 <= row <= height + 2:
+        # The creation receipt fixes row 2 as headers and row 3+ as data.
+        # Merged title and formula totals remain outside this projection.
+        if not 1 <= column <= width or not 2 <= row <= height + 2:
             raise ValueError('edited_table_scope_invalid')
-        before = table['rows'][row - 3][column - 1]
+        cells = table['headers'] if row == 2 else table['rows'][row - 3]
+        before = cells[column - 1]
         if not _equal_scalar(before, change['before']):
             raise ValueError('edited_table_before_mismatch')
-        table['rows'][row - 3][column - 1] = change['after']
+        cells[column - 1] = change['after']
     return table
 
 
@@ -86,13 +87,15 @@ def _derive(ref, base):
     if origin_coverage.get('derived_totals'):
         raise ValueError('edited_table_totals_unsupported')
     table = observed
-    total_changes = 0
+    total_changes = header_changes = 0
     for _, spec, source in reversed(edits):
         if len(source['observed']['sheets']) != 1:
             raise ValueError('edited_table_origin_invalid')
         sheet_name = source['observed']['sheets'][0]['name']
         table = _apply_changes(table, spec['changes'], sheet_name)
         total_changes += len(spec['changes'])
+        header_changes += sum(int(_CELL.fullmatch(change['cell']).group(2)) == 2
+                              for change in spec['changes'])
     if len(json.dumps(table, ensure_ascii=False, separators=(',', ':'))) > 32_000:
         raise office_source.SourceError('source_observation_oversize')
     office_source._writer_compatible(safe_root(ref['artifact']).name, 'table', table)
@@ -100,7 +103,10 @@ def _derive(ref, base):
                           else 'verified_generated_multi_edit_workbook_data_rows'),
                 'rows': len(table['rows']), 'columns': len(table['headers']),
                 'title_row_excluded': True, 'totals_row_excluded': True,
-                'edited_data_cells': total_changes, 'edit_depth': len(edits)}
+                'edited_data_cells': total_changes - header_changes, 'edit_depth': len(edits)}
+    if header_changes:
+        coverage.update(scope='verified_generated_edited_workbook_headers_and_data',
+                        edited_header_cells=header_changes)
     return origin_ref, [item[0] for item in reversed(edits)], table, coverage
 
 

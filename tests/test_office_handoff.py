@@ -3,6 +3,7 @@ from copy import deepcopy
 from hashlib import sha256
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -122,15 +123,16 @@ def test_restart_discovers_latest_entire_batch_and_verifies(selected,tmp_path):
         return path
     saved('old',[records[0]],100)
     latest=saved('new',records,200)
-    assert handoff.latest_generated_outputs(base=base)==records
+    task_base=tmp_path/'assistant_tasks'
+    assert handoff.latest_generated_outputs(base=base,task_base=task_base)==records
     assert calls==[str(p) for p in files]
     files[1].write_bytes(b'tampered latest')
     with pytest.raises(ValueError,match='artifact_changed'):
-        handoff.latest_generated_outputs(base=base)
+        handoff.latest_generated_outputs(base=base,task_base=task_base)
     # A malformed latest batch also blocks selection of the older valid file.
     latest.write_text(json.dumps({'engine':'observed_agent','state':'verified','artifacts':[{}]}),encoding='utf-8')
     with pytest.raises(ComputerError,match='office_handoff_history_invalid'):
-        handoff.latest_generated_outputs(base=base)
+        handoff.latest_generated_outputs(base=base,task_base=task_base)
 
 
 def test_history_discovery_caps_outcome_reads_at_one_hundred(tmp_path,monkeypatch):
@@ -141,7 +143,7 @@ def test_history_discovery_caps_outcome_reads_at_one_hundred(tmp_path,monkeypatc
         path.write_text('{}',encoding='utf-8')
     reads=[]
     monkeypatch.setattr(handoff,'read_record',lambda path: reads.append(path) or {})
-    assert handoff.latest_generated_outputs(base=base)==[]
+    assert handoff.latest_generated_outputs(base=base,task_base=tmp_path/'assistant_tasks')==[]
     assert len(reads)==100
 
 
@@ -153,7 +155,7 @@ def test_history_output_batch_must_bind_current_run(selected,tmp_path):
     path.write_text(json.dumps({'engine':'observed_agent','state':'verified','ok':True,
                                'run':str(path.parent/'wrong'),'artifacts':records}),encoding='utf-8')
     with pytest.raises(ComputerError,match='office_handoff_history_invalid'):
-        handoff.latest_generated_outputs(base=base)
+        handoff.latest_generated_outputs(base=base,task_base=tmp_path/'assistant_tasks')
     assert calls==[]
 
 
@@ -186,3 +188,167 @@ def test_restart_picks_new_capability_batch_and_rejects_latest_tampering(selecte
     latest.write_text(json.dumps({**saved, 'artifacts': [records[0]]}), encoding='utf-8')
     with pytest.raises(ComputerError, match='capability_result_changed'):
         handoff.latest_generated_outputs(base=session.root.parent, task_base=task_base)
+
+
+def _assistant_task(base, name, state, records, mtime):
+    task = base / name
+    task.mkdir(parents=True)
+    result = task / 'result.json'
+    result.write_text(json.dumps({'root': str(task), 'kind': 'office', 'state': state}),
+                      encoding='utf-8')
+    os.utime(result, ns=(mtime, mtime))
+    return task
+
+
+def test_assistant_task_ordinary_success_is_discovered_when_computer_base_empty(selected, tmp_path, monkeypatch):
+    from agent_service import task_history
+    _, _, records, _, calls = selected
+    task_base = tmp_path / 'assistant_tasks'
+    task = _assistant_task(task_base, 'task-' + 'a' * 32, 'succeeded', records, 200)
+    monkeypatch.setattr(task_history, 'inspect_task', lambda root, base: {
+        'root': str(root), 'state': 'succeeded', 'artifacts': [
+            {'path': r['path'], 'sha256': r['sha256']} for r in records]})
+
+    assert handoff.latest_generated_outputs(base=tmp_path / 'missing-computer',
+                                           task_base=task_base) == records
+    assert calls == [r['path'] for r in records]
+
+
+def test_recovered_failed_task_uses_verified_successful_continuation(selected, tmp_path, monkeypatch):
+    from agent_service import task_history, office_resume
+    _, _, records, _, _ = selected
+    task_base = tmp_path / 'assistant_tasks'
+    task = _assistant_task(task_base, 'task-' + 'b' * 32, 'failed', records, 100)
+    attempt_id = '1' * 32
+    pointer = task / 'resume-latest.json'
+    attempt = task / ('resume-' + attempt_id)
+    attempt.mkdir()
+    (attempt / 'outcome.json').write_text(json.dumps({'state': 'succeeded'}), encoding='utf-8')
+    pointer.write_text(json.dumps({'attempt_id': attempt_id}), encoding='utf-8')
+    os.utime(pointer, ns=(300, 300))
+    monkeypatch.setattr(office_resume, 'latest_continuation', lambda root, base: {
+        'state': 'succeeded', 'artifacts': records})
+    monkeypatch.setattr(task_history, 'inspect_task', lambda root, base: {
+        'root': str(root), 'state': 'failed', 'continuation': {'state': 'succeeded'},
+        'artifacts': [{'path': r['path'], 'sha256': r['sha256']} for r in records]})
+
+    assert handoff.latest_generated_outputs(base=tmp_path / 'missing-computer',
+                                           task_base=task_base) == records
+
+
+def test_newer_invalid_completed_assistant_task_blocks_older_success(selected, tmp_path, monkeypatch):
+    from agent_service import task_history
+    _, _, records, _, calls = selected
+    task_base = tmp_path / 'assistant_tasks'
+    older = _assistant_task(task_base, 'task-' + 'c' * 32, 'succeeded', records, 100)
+    newer = _assistant_task(task_base, 'task-' + 'd' * 32, 'succeeded', records, 300)
+    monkeypatch.setattr(task_history, 'inspect_task', lambda root, base: {
+        'root': str(root), 'state': 'succeeded' if root == older else 'needs_review',
+        'artifacts': [{'path': r['path'], 'sha256': r['sha256']} for r in records]})
+
+    with pytest.raises(ComputerError, match='office_handoff_history_invalid'):
+        handoff.latest_generated_outputs(base=tmp_path / 'missing-computer', task_base=task_base)
+    assert calls == []
+
+
+def test_unknown_assistant_task_is_not_auto_selected(selected, tmp_path, monkeypatch):
+    from agent_service import task_history
+    _, _, _, _, calls = selected
+    task_base = tmp_path / 'assistant_tasks'
+    _assistant_task(task_base, 'task-' + 'e' * 32, 'unknown', [], 300)
+    monkeypatch.setattr(task_history, 'inspect_task', lambda *_: pytest.fail('unknown must not inspect'))
+
+    assert handoff.latest_generated_outputs(base=tmp_path / 'missing-computer',
+                                           task_base=task_base) == []
+    assert calls == []
+
+
+def test_office_batch_skips_email_artifact_without_losing_documents(selected, tmp_path, monkeypatch):
+    from agent_service import task_history
+    _, _, records, _, calls = selected
+    task_base = tmp_path / 'assistant_tasks'
+    task = _assistant_task(task_base, 'task-' + 'f' * 32, 'succeeded', records, 200)
+    email = {'path': str(task / 'message.eml'), 'sha256': 'c' * 64}
+    artifacts = [{'path': r['path'], 'sha256': r['sha256']} for r in records] + [email]
+    monkeypatch.setattr(task_history, 'inspect_task', lambda root, base: {
+        'root': str(root), 'state': 'succeeded', 'artifacts': artifacts})
+
+    assert handoff.latest_generated_outputs(base=tmp_path / 'missing-computer',
+                                           task_base=task_base) == records
+    assert calls == [r['path'] for r in records]
+
+
+def test_newest_task_pointer_attempt_traversal_is_rejected_before_outside_read(
+        selected, tmp_path, monkeypatch):
+    _, _, _, _, _ = selected
+    task_base = tmp_path / 'assistant_tasks'
+    task = _assistant_task(task_base, 'task-' + '1' * 32, 'failed', [], 100)
+    pointer = task / 'resume-latest.json'
+    pointer.write_text(json.dumps({'attempt_id': '../outside'}), encoding='utf-8')
+    os.utime(pointer, ns=(300, 300))
+    reads = []
+    original = handoff.read_record
+    def track(path):
+        reads.append(Path(path).absolute())
+        return original(path)
+    monkeypatch.setattr(handoff, 'read_record', track)
+
+    with pytest.raises(ComputerError, match='office_handoff_history_invalid'):
+        handoff.latest_generated_outputs(base=tmp_path / 'missing-computer', task_base=task_base)
+    assert all('outside' not in str(path) for path in reads)
+
+
+def test_newest_task_pointer_attempt_junction_is_rejected_before_outside_read(
+        selected, tmp_path, monkeypatch):
+    _, _, _, _, _ = selected
+    task_base = tmp_path / 'assistant_tasks'
+    task = _assistant_task(task_base, 'task-' + '2' * 32, 'failed', [], 100)
+    outside = tmp_path / 'outside-attempt'
+    outside.mkdir()
+    (outside / 'outcome.json').write_text(json.dumps({'state': 'succeeded'}), encoding='utf-8')
+    attempt_id = '2' * 32
+    attempt = task / ('resume-' + attempt_id)
+    try:
+        attempt.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip('directory symlink creation unavailable')
+    pointer = task / 'resume-latest.json'
+    pointer.write_text(json.dumps({'attempt_id': attempt_id}), encoding='utf-8')
+    os.utime(pointer, ns=(300, 300))
+    reads = []
+    original = handoff.read_record
+    def track(path):
+        value = Path(path).absolute()
+        reads.append(value)
+        if value == (outside / 'outcome.json').absolute():
+            pytest.fail('read followed the attempt junction')
+        return original(path)
+    monkeypatch.setattr(handoff, 'read_record', track)
+
+    with pytest.raises(ComputerError, match='office_handoff_history_invalid'):
+        handoff.latest_generated_outputs(base=tmp_path / 'missing-computer', task_base=task_base)
+    assert (outside / 'outcome.json').absolute() not in reads
+
+
+def test_only_newest_continuation_gets_full_validation(selected, tmp_path, monkeypatch):
+    from agent_service import task_history, office_resume
+    _, _, records, _, _ = selected
+    task_base = tmp_path / 'assistant_tasks'
+    older = _assistant_task(task_base, 'task-' + '3' * 32, 'failed', records, 100)
+    attempt_id = '3' * 32
+    attempt = older / ('resume-' + attempt_id)
+    attempt.mkdir()
+    (attempt / 'outcome.json').write_text(json.dumps({'state': 'succeeded'}), encoding='utf-8')
+    pointer = older / 'resume-latest.json'
+    pointer.write_text(json.dumps({'attempt_id': attempt_id}), encoding='utf-8')
+    os.utime(pointer, ns=(200, 200))
+    newest = _assistant_task(task_base, 'task-' + '4' * 32, 'succeeded', records, 300)
+    monkeypatch.setattr(office_resume, 'latest_continuation',
+                        lambda *_: pytest.fail('older candidate was fully verified'))
+    monkeypatch.setattr(task_history, 'inspect_task', lambda root, base: {
+        'root': str(root), 'state': 'succeeded',
+        'artifacts': [{'path': r['path'], 'sha256': r['sha256']} for r in records]})
+
+    assert handoff.latest_generated_outputs(base=tmp_path / 'missing-computer',
+                                           task_base=task_base) == records
+    assert newest.exists()

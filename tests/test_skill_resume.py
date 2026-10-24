@@ -8,7 +8,8 @@ import uuid
 
 import pytest
 
-from agent_service import local_skills as skills, office_workflow as workflow, skill_resume
+from agent_service import (local_skills as skills, office_readiness,
+                           office_workflow as workflow, skill_resume)
 from test_local_skills import fake_office, manifest, source
 
 
@@ -44,6 +45,7 @@ def _contract(tmp_path, monkeypatch):
 
     from agent_service import office_host
     monkeypatch.setattr(office_host, "execute_office_supervised", supervised)
+    monkeypatch.setattr(office_readiness, "preflight_office_window", lambda: None)
     outcome = skills.run_skill(store, "copy-doc", task, base, source_file=source(tmp_path))
     assert outcome["state"] == "cancelled" and outcome["completed"] == ["s1"]
     assert (task / "skill-resume-permit.json").is_file()

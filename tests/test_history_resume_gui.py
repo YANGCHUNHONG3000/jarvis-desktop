@@ -221,6 +221,27 @@ def desktop(monkeypatch, tmp_path):
     monkeypatch.setattr(mailbox_panel, "attach_mailbox_tab", attach_mailbox)
     monkeypatch.setattr(budget, "BudgetLedger", lambda: type("B", (), {"snapshot": lambda self: {
         "charged_micro": 0, "remaining_micro": 5_000_000, "held_micro": 0}})())
+    from agent_service import computer_panel, computer_goal_panel
+
+    class Panel:
+        running = False
+
+        def __init__(self, tab):
+            self.tab = tab
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+        def use_generated_artifacts(self, _records):
+            pass
+
+    monkeypatch.setattr(computer_panel, "attach_computer_tab",
+                        lambda tab, *_args, **_kwargs: Panel(tab))
+    monkeypatch.setattr(computer_goal_panel, "attach_goal_tab",
+                        lambda tab, *_args, **_kwargs: Panel(tab))
     state = {"eligible": True, "reason": "ready", "continuation": None,
              "original_state": "cancelled",
              "preview_kind": None,
@@ -1141,9 +1162,17 @@ def test_changed_history_output_blocks_before_model_and_clear_removes_ref(deskto
     assert any("开始前已变化" in str(w.options["textvariable"].get())
                for w in _Widget.all if w.options.get("textvariable"))
     source_entry = next(w for w in _Widget.all if w.options.get("width") == 38)
-    assert source_entry.options["textvariable"].get() == ""
+    assert source_entry.options["textvariable"].get() == str(artifact)
+    _button("开始任务").invoke()
+    assert _Process.created == []
+    assert len(list(original_root.parent.glob("task-*"))) == 1
     _button("清除").invoke()
     assert source_entry.options["textvariable"].get() == ""
+    _button("开始任务").invoke()
+    _Thread.run("jarvis-agent")
+    command = _Process.created[-1].command
+    assert "--source-file" not in command
+    assert "--source-artifact-json" not in command
     assert (original_root / "result.json").read_bytes() == original
 
 
@@ -1170,8 +1199,6 @@ def test_current_office_output_populates_hash_and_can_be_selected(desktop, monke
     _button("开始任务").invoke()
     _Thread.run("jarvis-agent")
     _pump(root)
-    current_use = [w for w in _Widget.all if w.options.get("text") == "用于下一任务"][1]
-    assert current_use.cget("state") == "normal"
     command = _Process.created[0].command
     task_root = Path(command[command.index("--task-root") + 1])
     artifact = task_root / ("workflow-" + "e" * 32) / "s1" / "document.docx"
@@ -1183,7 +1210,6 @@ def test_current_office_output_populates_hash_and_can_be_selected(desktop, monke
         return _artifact_ref(task_root, artifact, digest)
 
     monkeypatch.setattr(artifact_source, "prepare_artifact_source", prepare)
-    current_use.invoke()
     _Thread.run("jarvis-artifact-source-select")
     _pump(root)
     assert seen == [(str(artifact), digest, original_root.parent)]
@@ -1608,7 +1634,7 @@ def test_local_skill_rejects_version_switch_between_prepare_and_start(
 
 def test_local_skill_durable_office_result_uses_existing_output_and_history(desktop, monkeypatch, tmp_path):
     root, original_root, _state, _tree, original = desktop
-    from agent_service import local_skills
+    from agent_service import local_skills, artifact_source
     _mock_published_skill_version(monkeypatch)
     gate = {"remaining": 2, "calls": 0}
     def status(*_args):
@@ -1645,7 +1671,17 @@ def test_local_skill_durable_office_result_uses_existing_output_and_history(desk
     _Thread.run("jarvis-agent")
     _pump(root)
     assert _button("打开成果").cget("state") == "normal"
-    assert [w for w in _Widget.all if w.options.get("text") == "用于下一任务"][1].cget("state") == "normal"
+    current_use = [w for w in _Widget.all if w.options.get("text") == "用于下一任务"][1]
+    assert current_use.cget("state") == "disabled"
+    command = _Process.created[-1].command
+    task_root = Path(command[command.index("--task-root") + 1])
+    artifact = task_root / ("workflow-" + "e" * 32) / "s1" / "spreadsheet.xlsx"
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    monkeypatch.setattr(artifact_source, "prepare_artifact_source",
+                        lambda *_args: _artifact_ref(task_root, artifact, digest))
+    _Thread.run("jarvis-artifact-source-select")
+    _pump(root)
+    assert current_use.cget("state") == "normal"
     assert any("本地技能成果已保存并核验" in str(w.options["textvariable"].get())
                for w in _Widget.all if w.options.get("textvariable"))
     assert any(thread.name == "jarvis-history-list" for thread in _Thread.all)

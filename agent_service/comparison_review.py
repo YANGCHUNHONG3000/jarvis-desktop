@@ -160,11 +160,17 @@ def build_review_context(context, validated_selection):
     from .publisher_roles import enabled as role_policy, candidates
     if role_policy(context.get('goal', {})):
         for source in result['sources']:
-            source['project_role_candidates'] = candidates(source)
+            source['project_role_candidates'] = candidates(source,
+                policy=context['goal']['comparison']['publisher_policy'])
     return result
 
 
-def _family(url):
+def _family(url, policy=None):
+    if policy == 'project_attribution_v6':
+        from .hosted_document_policy import family
+        hosted = family(url)
+        if hosted is not None:
+            return hosted
     try:
         parsed = urlsplit(url)
         if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
@@ -187,6 +193,7 @@ def assess(context, validated_selection, review):
     checked, publishers, cells, publisher_evidence = {}, {}, {}, {}
     from .publisher_roles import enabled as role_policy, role, compatible
     roles_enabled = role_policy(context.get('goal', {}))
+    policy = context.get('goal', {}).get('comparison', {}).get('publisher_policy')
     publisher_roles = {}
     relevant = 0
     for entry in review['sources']:
@@ -222,7 +229,7 @@ def assess(context, validated_selection, review):
             publishers[sid] = (' '.join(publisher['name'].split()).casefold()
                                if not v3 or status == 'supported' else None)
             if roles_enabled and status == 'supported':
-                publisher_roles[sid] = role(sources[ids.index(sid)], publisher)
+                publisher_roles[sid] = role(sources[ids.index(sid)], publisher, policy=policy)
         else:
             publishers[sid] = None
             publisher_evidence[sid] = 'unknown'
@@ -266,7 +273,7 @@ def assess(context, validated_selection, review):
         # sha256 binds the complete captured text, including beyond the model window.
         same_normalized = ('normalized_sha256' in a and 'normalized_sha256' in b
                            and a['normalized_sha256'] == b['normalized_sha256'])
-        if (_family(a['url']) == _family(b['url']) or a['sha256'] == b['sha256'] or same_normalized
+        if (_family(a['url'], policy) == _family(b['url'], policy) or a['sha256'] == b['sha256'] or same_normalized
                 or publishers[ids[i]] is not None and publishers[ids[i]] == publishers[ids[j]]
                 or pairs[i, j]['relation'] == 'same'):
             parent[root(j)] = root(i)
@@ -303,6 +310,8 @@ def assess(context, validated_selection, review):
         project_enabled = project_policy(context.get('goal', {}))
         if project_enabled:
             from .project_scope import transfer_scope
+        if policy == 'project_attribution_v6':
+            from .hosted_document_policy import transfer_scope
         scope_enabled = scoped(context.get('goal', {})) or project_enabled
         scopes = {s['id']: transfer_scope(s['url']) for s in sources} if scope_enabled else {}
         support, scope_rejections, support_reasons = {}, {}, {}
@@ -315,7 +324,7 @@ def assess(context, validated_selection, review):
                 # Same registrable-domain family is not enough to transfer identity.
                 names = {publishers[a] for a in anchors}
                 coexist = (roles_enabled and len(names) > 1 and
-                           compatible({s['id']: s for s in sources}, anchors, publisher_roles))
+                           compatible({s['id']: s for s in sources}, anchors, publisher_roles, policy=policy))
                 support[sid] = anchors[0] if len(names) == 1 or coexist else None
                 if scope_enabled:
                     rejected = [a for a in group if publishers[a] is not None

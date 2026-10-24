@@ -46,7 +46,7 @@ def _text(p):
     return p.preview_box.get('1.0', 'end')
 
 
-def test_mode11_uses_verified_source_list_and_selects_latest(panel, monkeypatch):
+def test_mode11_uses_verified_source_list_and_defaults_to_task_selection(panel, monkeypatch):
     from agent_service import office_handoff
 
     p = panel
@@ -65,9 +65,10 @@ def test_mode11_uses_verified_source_list_and_selects_latest(panel, monkeypatch)
     p.messages.put(('capability_sources', captured[0][1](object()), None))
     p.poll()
     assert p.capability_sources == refs
-    assert p.control.current() == 1
-    assert '无来源文件' in p.control['values'][0]
-    assert 'saved.docx' in p.control['values'][1]
+    assert p.control.current() == 0
+    assert '自动按任务' in p.control['values'][0]
+    assert '无来源文件' in p.control['values'][1]
+    assert 'saved.docx' in p.control['values'][2]
     assert str(p.propose_button['state']) == 'disabled'
 
 
@@ -79,8 +80,8 @@ def test_local_preview_uses_real_session_without_model_or_api(panel, tmp_path, m
     session = ComputerSession.create(tmp_path / 'sessions')
     p.session = session
     p.capability_sources = []
-    p.control.configure(values=['无来源文件'])
-    p.control.current(0)
+    p.control.configure(values=['自动按任务选择输入', '无来源文件'])
+    p.control.current(1)
     monkeypatch.setattr(model, 'CloudClient', lambda **kw: pytest.fail('preview called API'))
     pending = []
     monkeypatch.setattr(p, 'start', lambda kind, work: pending.append((kind, work)))
@@ -101,8 +102,8 @@ def test_preview_binds_selected_source_and_approval_passes_exact_plan(panel, mon
     _mode(p, monkeypatch)
     ref = {'artifact': 'selected.xlsx', 'sha256': 'b' * 64}
     p.capability_sources = [ref]
-    p.control.configure(values=['无来源文件', '1. selected.xlsx'])
-    p.control.current(1)
+    p.control.configure(values=['自动按任务选择输入', '无来源文件', '1. selected.xlsx'])
+    p.control.current(2)
     p.text.insert('1.0', '请按已有表格制作新的报告')
     p.text.edit_modified(False)
     calls = []
@@ -141,6 +142,33 @@ def test_stop_discards_late_capability_preview(panel, monkeypatch):
     p.poll()
     assert p.plan is None and str(p.execute_button['state']) == 'disabled'
     assert '本地预览完成' not in p.status.get()
+
+
+def test_auto_preview_passes_snapshot_of_candidate_batch(panel, monkeypatch):
+    p = panel
+    _mode(p, monkeypatch)
+    refs = [{'artifact': 'sheet.xlsx', 'sha256': 'a' * 64},
+            {'artifact': 'report.docx', 'sha256': 'b' * 64}]
+    p.capability_sources = refs
+    p.control.configure(values=['自动按任务选择输入', '无来源文件', 'sheet.xlsx', 'report.docx'])
+    p.control.current(0)
+    pending, calls = [], []
+    monkeypatch.setattr(p, 'start', lambda kind, work: pending.append(work))
+    monkeypatch.setattr(capability_router, 'prepare', lambda s, text, **kw: calls.append((text, kw)))
+    p.preview_capability('根据Excel生成Word')
+    refs[0]['sha256'] = 'c' * 64
+    pending[0](object())
+    assert calls[0][0] == '根据Excel生成Word'
+    assert calls[0][1]['source_refs'][0]['sha256'] == 'a' * 64
+    assert 'source_ref' not in calls[0][1]
+
+
+def test_auto_without_candidates_requires_explicit_no_source(panel):
+    panel.capability_sources = []
+    panel.control.configure(values=['自动按任务选择输入', '无来源文件'])
+    panel.control.current(0)
+    with pytest.raises(Exception, match='没有可用的上一任务成果'):
+        panel.preview_capability('做表格')
 
 
 def test_failure_shows_raw_code_and_never_calls_handoff(panel):
@@ -183,3 +211,72 @@ def test_success_claims_handoff_only_after_callback_and_callback_failure_is_clea
     assert '自动接力未完成' in _text(p) and '自动接力未完成' in p.status.get()
     assert '已接到下一任务' not in _text(p)
     assert '已自动接入下一任务' not in _text(p)
+
+
+def test_clarification_button_loads_backend_candidates_on_worker(panel, monkeypatch):
+    from agent_service import capability_clarification
+    rows = [{'run': 'verified-run', 'instruction': '保留原任务',
+             'sources': [{'id': 'S1', 'filename': 'source.docx', 'format': '.docx'}]}]
+    calls, scheduled = [], []
+    monkeypatch.setattr(capability_clarification, 'pending', lambda: calls.append(True) or rows)
+    monkeypatch.setattr(panel, 'start', lambda kind, work: scheduled.append((kind, work)))
+    panel.mode.set(ui.MODES[11])
+
+    panel.list_capability_clarifications()
+
+    assert calls == [] and scheduled[0][0] == 'capability_clarifications'
+    assert scheduled[0][1](object()) == rows and calls == [True]
+
+
+def test_clarification_modal_lists_verified_source_choices(panel):
+    rows = [{'run': 'verified-run', 'instruction': '保留原任务',
+             'sources': [{'id': 'S1', 'filename': 'source.docx', 'format': '.docx'},
+                         {'id': 'S2', 'filename': 'other.xlsx', 'format': '.xlsx'}]}]
+    panel.mode.set(ui.MODES[11])
+
+    panel.open_capability_clarification_selector(rows)
+
+    window = panel.capability_clarification_window
+    children = window.winfo_children()
+    listbox = next(child for child in children if isinstance(child, tk.Listbox))
+    source = next(child for child in children if isinstance(child, ttk.Combobox))
+    assert '保留原任务' in listbox.get(0)
+    assert str(source.cget('state')) == 'readonly'
+    window.destroy()
+
+
+def test_clarification_source_selection_prepares_new_plan_for_normal_approval(panel, monkeypatch):
+    from agent_service import capability_clarification
+    scheduled, calls = [], []
+    plan = {'mode': 'capability', 'schema': 3, 'instruction': '保留原任务',
+            'source_ref': {'artifact': 'other.xlsx'}, 'candidates': []}
+    monkeypatch.setattr(capability_clarification, 'prepare',
+                        lambda session, run, source_id: calls.append((session, run, source_id)) or plan)
+    monkeypatch.setattr(panel, 'start', lambda kind, work: scheduled.append((kind, work)))
+    panel.mode.set(ui.MODES[11])
+
+    panel.prepare_capability_clarification('verified-run', 'S2')
+
+    session = object()
+    assert calls == []
+    assert scheduled[0][0] == 'capability_clarification_prepare'
+    assert scheduled[0][1](session) is plan
+    assert calls == [(session, 'verified-run', 'S2')]
+    panel.messages.put(('capability_clarification_prepare', plan, None))
+    panel.poll()
+    assert panel.plan is plan and str(panel.execute_button['state']) == 'normal'
+    assert '尚未执行办公步骤' in panel.status.get()
+
+
+def test_ambiguous_outcome_offers_only_explicit_clarification(panel, monkeypatch):
+    panel.mode.set(ui.MODES[11])
+    panel.messages.put(('capability_execute', {
+        'ok': False, 'code': 'capability_source_ambiguous', 'run': 'known-run', 'artifacts': []
+    }, None))
+    monkeypatch.setattr(capability_router, 'describe_result', lambda _result: '来源不明确。')
+
+    panel.poll()
+
+    assert '明确来源后继续' in _text(panel)
+    assert '未知执行不会列入继续列表' in _text(panel)
+    assert panel.plan is None

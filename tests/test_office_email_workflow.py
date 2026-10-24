@@ -77,7 +77,7 @@ def test_draft_attaches_only_verified_prior_files_and_resumes_without_replay(tmp
 
 
 def test_default_dispatch_uses_office_host_for_office_and_local_draft_for_email(tmp_path, monkeypatch):
-    from agent_service import office_host
+    from agent_service import office_host, office_readiness
     calls = []
 
     def fake_host(spec, step_root, should_stop):
@@ -85,6 +85,7 @@ def test_default_dispatch_uses_office_host_for_office_and_local_draft_for_email(
         return _office_result(spec, step_root)
 
     monkeypatch.setattr(office_host, "execute_office_supervised", fake_host)
+    monkeypatch.setattr(office_readiness, "preflight_office_window", lambda: None)
     result = run_office_workflow(_steps([]), _root(tmp_path))
     assert result["state"] == "succeeded" and calls == ["spreadsheet", "document"]
     assert Path(result["receipts"]["s3"]["artifact"]).name == "draft.eml"

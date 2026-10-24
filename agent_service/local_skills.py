@@ -23,16 +23,17 @@ from .office_source_plan import resolve_source_steps
 
 _ID = re.compile(r"[a-z][a-z0-9-]{2,47}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
-_CODE = ("local_skills.py", "office.py", "office_host.py", "office_workflow.py",
+_CODE = ("local_skills.py", "office.py", "office_host.py", "office_workflow.py", "office_readiness.py",
          "office_source.py", "office_source_plan.py", "artifact_source.py",
          "task_history.py", "email_draft.py", "mail_export.py", "office_resume.py",
+         "office_bundle.py", "office_bundle_resume.py", "capability_source_choice.py", "office_handoff.py",
          "assistant.py", "skill_matching.py", "skill_resume.py", "gap_recovery.py",
          "adapter_development.py",
          "source_intake.py", "external_document_source.py", "external_document_source_host.py",
          "workbook_source.py", "workbook_source_host.py", "workbook_plan.py",
          "edited_artifact_source.py", "generated_edit_table.py", "verified_edit_document.py",
          "verified_edit_workbook.py", "structured_document_source.py", "office_edit.py", "office_edit_host.py",
-         "computer.py", "computer_agent_tools.py")
+         "computer.py", "computer_agent_tools.py", "verification_progress.py")
 
 
 class SkillError(ValueError):
@@ -411,13 +412,13 @@ def _verify_success(root, base, digest, expected_result_hash=None):
     if expected_result_hash is not None and sha256(result_path.read_bytes()).hexdigest() != expected_result_hash:
         raise SkillError("skill_live_result_changed")
     info = result.get("skill", {})
-    if (result.get("state") not in {"succeeded", "cancelled"}
+    if (result.get("state") not in {"succeeded", "cancelled", "failed"}
             or result.get("ok") is not (result.get("state") == "succeeded")
             or info.get("sha256") != digest or info.get("implementation_sha256") != implementation_sha256()
             or info.get("mode") not in {"trial", "active"}):
         raise SkillError("skill_live_result_invalid")
     inspected = history.inspect_task(root, base)
-    resumed = result["state"] == "cancelled"
+    resumed = result["state"] in {"cancelled", "failed"}
     if resumed:
         from .skill_resume import latest_continuation
         continuation = latest_continuation(root, base)
@@ -501,7 +502,7 @@ def record_live(store, skill_id, digest, task_root, base):
                   "task_result_sha256": sha256((task / "result.json").read_bytes()).hexdigest()}
         if request.get("source_retry") is not None:
             result["source_retry"] = request["source_retry"]
-        if workflow._read_json(task / "result.json").get("state") == "cancelled":
+        if workflow._read_json(task / "result.json").get("state") in {"cancelled", "failed"}:
             pointer = task / "skill-resume-latest.json"
             if _linked(pointer) or not pointer.is_file():
                 raise SkillError("skill_live_continuation_unverified")
@@ -784,6 +785,7 @@ def _run_claimed(root, skill_id, state, mode, digest, candidate, task, base, dea
     except Exception:
         error = "skill_effect_unknown"
     receipts = {}
+    unknown = None
     try:
         if workflow_root.is_dir():
             receipts, unknown = workflow._resume_preflight(steps, workflow_root)
@@ -792,7 +794,16 @@ def _run_claimed(root, skill_id, state, mode, digest, candidate, task, base, dea
     except (ValueError, TypeError, KeyError, OSError):
         error = "skill_receipt_unknown"
     outcome = run.get("state") if type(run) is dict else "unknown"
-    if (error or outcome not in {"succeeded", "cancelled", "timed_out", "unknown"}
+    predispatch_block = (execute is None and not error and unknown is None
+        and type(run) is dict and outcome == "failed"
+        and run.get("error") in {"office_ui_blocked", "office_ui_unavailable"}
+        and len(receipts) < len(steps)
+        and steps[len(receipts)]["action"] != "email_draft"
+        and run == {"ok": False, "state": "failed", "root": str(workflow_root),
+                    "completed": list(receipts), "receipts": receipts,
+                    "step": steps[len(receipts)]["id"], "error": run["error"]})
+    if (error or outcome not in {"succeeded", "cancelled", "timed_out", "unknown", "failed"}
+            or outcome == "failed" and not predispatch_block
             or outcome == "succeeded" and len(receipts) != len(steps)):
         outcome = "unknown"
     artifacts = [{"step": key, "path": receipt["artifact"], "sha256": receipt["sha256"]}
@@ -826,7 +837,8 @@ def _run_claimed(root, skill_id, state, mode, digest, candidate, task, base, dea
                 # The effect remains successful. Missing provenance only blocks
                 # later expansion; it must not rewrite a verified task result.
                 pass
-    if outcome == "cancelled" and execute is None and 0 < len(receipts) < len(steps):
+    if (execute is None and (predispatch_block
+            or outcome == "cancelled" and 0 < len(receipts) < len(steps))):
         # A permit is published after the parent result, and for active mode
         # after the disabled candidate state, are durable. Trial permits bind
         # the same prefix without granting active runs.

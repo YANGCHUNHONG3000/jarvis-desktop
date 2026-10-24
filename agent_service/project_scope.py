@@ -13,7 +13,7 @@ _RESERVED = frozenset(('api', 'docs', 'help', 'explore', 'search', 'about', 'log
 
 
 def enabled(goal):
-    return goal.get('comparison', {}).get('publisher_policy') in {POLICY, 'project_attribution_v4', 'project_attribution_v5'}
+    return goal.get('comparison', {}).get('publisher_policy') in {POLICY, 'project_attribution_v4', 'project_attribution_v5', 'project_attribution_v6'}
 
 
 def _parsed(url):

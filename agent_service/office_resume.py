@@ -18,6 +18,7 @@ from . import task_history as history
 _ATTEMPT = re.compile(r"[0-9a-f]{32}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _TERMINAL = {"succeeded", "cancelled", "timed_out", "unknown", "failed"}
+_PREFLIGHT_BLOCKS = {"office_ui_blocked", "office_ui_unavailable"}
 _MAX_PARENT = 100_000
 
 
@@ -103,6 +104,9 @@ def _assert_plain_office(root):
     if _linked(request) or request.exists():
         raise ResumeError("resume_skill_owned")
     result, _ = _parent(root)
+    if 'bundle_sha256' in result or (root / 'bundle-request.json').exists():
+        # Joint-source recovery needs its own reviewed task guard before enabling.
+        raise ResumeError('resume_bundle_owned')
     if "skill" in result:
         raise ResumeError("resume_skill_owned")
 
@@ -147,6 +151,9 @@ def _snapshot(task_root, base):
     token_data = {"original": original_hash, "manifest": manifest_hash,
                   "receipts": receipt_hashes}
     token = workflow._hash(token_data)
+    if 'bundle_sha256' in result or (root / 'bundle-request.json').exists():
+        from .office_bundle import verify_task
+        verify_task(root, base, steps)
     return {"root": root, "workflow_root": workflow_root, "steps": steps,
             "receipts": receipts, "original_sha256": original_hash,
             "manifest_sha256": manifest_hash, "token": token,
@@ -162,16 +169,25 @@ def _public(snapshot):
             "completed": completed, "total": total, "remaining": total - completed}
 
 
-def preview_resume(task_root, base) -> dict:
+def _owned_snapshot(task_root, base, owner_guard):
+    root = _task(task_root, base)
+    proof = owner_guard(root)
+    snapshot = _snapshot(root, base)
+    if proof is not None:
+        snapshot["token"] = workflow._hash({"snapshot": snapshot["token"], "owner": proof})
+    return snapshot
+
+
+def _preview_resume(task_root, base, *, owner_guard) -> dict:
     """Read-only proof of a contiguous, hash-verified Office continuation."""
     empty = {"eligible": False, "reason": "resume_unavailable", "task_root": None,
              "workflow_root": None, "token": None, "completed": 0, "total": 0,
              "remaining": 0}
     try:
-        _assert_plain_office(_task(task_root, base))
-        snapshot = _snapshot(task_root, base)
+        owner_guard(_task(task_root, base))
+        snapshot = _owned_snapshot(task_root, base, owner_guard)
         public = _public(snapshot)
-        prior = latest_continuation(snapshot["root"], base)
+        prior = _latest_continuation(snapshot["root"], base, owner_guard=owner_guard)
         if (public["completed"] > snapshot["original_completed"] and prior is None
                 and public["remaining"] > 0):
             public.update(eligible=False, reason="resume_unclaimed_receipts")
@@ -215,7 +231,12 @@ def _outcome(snapshot, attempt_id, before_token, state, *, error=None):
     return result
 
 
-def resume_task(task_root, base, expected_token, attempt_id, *, execute=None, deadline=None) -> dict:
+def _durable_progress(outcome):
+    return (outcome.get("state") in {"succeeded", "cancelled", "timed_out"}
+            or (outcome.get("state") == "blocked" and outcome.get("error") in _PREFLIGHT_BLOCKS))
+
+
+def _resume_task(task_root, base, expected_token, attempt_id, *, owner_guard, execute=None, deadline=None) -> dict:
     """Reserve one attempt, recheck under locks, and execute only missing steps."""
     if type(attempt_id) is not str or not _ATTEMPT.fullmatch(attempt_id):
         raise ResumeError("resume_attempt_invalid")
@@ -226,11 +247,11 @@ def resume_task(task_root, base, expected_token, attempt_id, *, execute=None, de
     if type(deadline) not in (int, float) or not math.isfinite(deadline):
         raise ResumeError("resume_deadline_invalid")
     root = _task(task_root, base)
-    _assert_plain_office(root)
+    owner_guard(root)
     attempt = root / ("resume-" + attempt_id)
     try:
         with workflow._owner(root):
-            _assert_plain_office(root)
+            owner_guard(root)
             if _linked(attempt):
                 raise ResumeError("resume_attempt_scope_invalid")
             if attempt.exists():
@@ -246,11 +267,11 @@ def resume_task(task_root, base, expected_token, attempt_id, *, execute=None, de
             workflow._write_new(attempt / "request.json", request)
             before = None
             try:
-                before = _snapshot(root, base)
+                before = _owned_snapshot(root, base, owner_guard)
                 if (before["original_state"] == "succeeded"
                         and len(before["receipts"]) == len(before["steps"])):
                     raise ResumeError("resume_already_complete")
-                prior = latest_continuation(root, base)
+                prior = _latest_continuation(root, base, owner_guard=owner_guard)
                 if prior is not None and prior.get("state") == "succeeded":
                     raise ResumeError("resume_already_complete")
                 if (len(before["receipts"]) > before["original_completed"]
@@ -260,7 +281,7 @@ def resume_task(task_root, base, expected_token, attempt_id, *, execute=None, de
                     raise ResumeError("resume_preview_stale")
 
                 def guarded():
-                    current = _snapshot(root, base)
+                    current = _owned_snapshot(root, base, owner_guard)
                     if current["token"] != expected_token:
                         raise ResumeError("resume_preview_stale")
 
@@ -268,19 +289,22 @@ def resume_task(task_root, base, expected_token, attempt_id, *, execute=None, de
                     before["steps"], before["workflow_root"], execute=execute, resume=True,
                     deadline=deadline, cancel_file=cancel, resume_guard=guarded,
                     result_root=attempt)
-                after = _snapshot(root, base)
+                after = _owned_snapshot(root, base, owner_guard)
                 if run.get("state") == "succeeded" and len(after["receipts"]) == len(after["steps"]):
                     state = "succeeded"
                 elif run.get("state") in {"cancelled", "timed_out"}:
                     state = run["state"]
+                elif run.get("state") == "failed" and run.get("error") in _PREFLIGHT_BLOCKS:
+                    state = "blocked"
                 else:
                     state = "unknown"
-                outcome = _outcome(after, attempt_id, expected_token, state)
+                outcome = _outcome(after, attempt_id, expected_token, state,
+                                   error=run["error"] if state == "blocked" else None)
             except (ValueError, TypeError, KeyError, OSError) as exc:
                 code = str(exc) if isinstance(exc, ValueError) else "resume_failed"
                 code = code if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) else "resume_failed"
                 try:
-                    after = _snapshot(root, base)
+                    after = _owned_snapshot(root, base, owner_guard)
                 except (ValueError, TypeError, KeyError, OSError):
                     after = None
                 state = "blocked" if code in {"resume_preview_stale", "workflow_busy",
@@ -288,8 +312,7 @@ def resume_task(task_root, base, expected_token, attempt_id, *, execute=None, de
                 outcome = _outcome(after or before, attempt_id, expected_token, state,
                                    error=code)
             _publish(attempt / "outcome.json", outcome)
-            if outcome["token_after"] is not None and outcome["state"] in {
-                    "succeeded", "cancelled", "timed_out"}:
+            if outcome["token_after"] is not None and _durable_progress(outcome):
                 pointer = {"version": 1, "attempt_id": attempt_id,
                            "original_sha256": outcome["original_sha256"],
                            "manifest_sha256": outcome["manifest_sha256"],
@@ -303,14 +326,14 @@ def resume_task(task_root, base, expected_token, attempt_id, *, execute=None, de
         raise ResumeError(str(exc)) from exc
 
 
-def read_resume_result(task_root, base, attempt_id) -> dict:
+def _read_resume_result(task_root, base, attempt_id, *, owner_guard) -> dict:
     """Read durable attempt evidence and recompute every claimed artifact hash."""
     unknown = {"ok": False, "state": "unknown", "attempt_id": attempt_id}
     if type(attempt_id) is not str or not _ATTEMPT.fullmatch(attempt_id):
         return unknown
     try:
         root = _task(task_root, base)
-        _assert_plain_office(root)
+        owner_guard(root)
         attempt = root / ("resume-" + attempt_id)
         if _linked(attempt) or not attempt.is_dir():
             return unknown
@@ -327,7 +350,7 @@ def read_resume_result(task_root, base, attempt_id) -> dict:
                                                 "blocked", "unknown"}
                 or type(outcome.get("ok")) is not bool):
             return unknown
-        snapshot = _snapshot(root, base)
+        snapshot = _owned_snapshot(root, base, owner_guard)
         if (outcome.get("original_sha256") != snapshot["original_sha256"]
                 or outcome.get("manifest_sha256") != snapshot["manifest_sha256"]
                 or outcome.get("token_after") != snapshot["token"]
@@ -342,24 +365,28 @@ def read_resume_result(task_root, base, attempt_id) -> dict:
         if (outcome.get("ok") is True) != (outcome.get("state") == "succeeded"
                                                and len(snapshot["receipts"]) == len(snapshot["steps"])):
             return unknown
-        if outcome["state"] in {"succeeded", "cancelled", "timed_out"}:
+        if _durable_progress(outcome):
             run = _json_bytes(_small_bytes(attempt / "result.json", workflow._MAX_JSON))
-            if (run.get("state") != outcome["state"]
+            blocked = outcome["state"] == "blocked"
+            if (run.get("state") != ("failed" if blocked else outcome["state"])
                     or run.get("ok") is not outcome["ok"]
                     or run.get("root") != str(snapshot["workflow_root"])
                     or run.get("completed") != list(snapshot["receipts"])
                     or run.get("receipts") != snapshot["receipts"]):
+                return unknown
+            if blocked and (outcome["remaining"] < 1 or run.get("error") != outcome["error"]
+                    or run.get("step") != snapshot["steps"][len(snapshot["receipts"])]["id"]):
                 return unknown
         return outcome
     except (ValueError, TypeError, KeyError, OSError):
         return unknown
 
 
-def latest_continuation(task_root, base):
+def _latest_continuation(task_root, base, *, owner_guard):
     """Return a trusted latest overlay only when pointer and outcome still agree."""
     try:
         root = _task(task_root, base)
-        _assert_plain_office(root)
+        owner_guard(root)
         pointer = _json_bytes(_small_bytes(root / "resume-latest.json", workflow._MAX_JSON))
         if set(pointer) != {"version", "attempt_id", "original_sha256", "manifest_sha256",
                             "token_after", "outcome_sha256"} or pointer["version"] != 1:
@@ -371,8 +398,8 @@ def latest_continuation(task_root, base):
         raw = _small_bytes(path, workflow._MAX_JSON)
         if sha256(raw).hexdigest() != pointer["outcome_sha256"]:
             return None
-        outcome = read_resume_result(root, base, attempt_id)
-        if (outcome.get("state") not in {"succeeded", "cancelled", "timed_out"}
+        outcome = _read_resume_result(root, base, attempt_id, owner_guard=owner_guard)
+        if (not _durable_progress(outcome)
                 or pointer["original_sha256"] != outcome["original_sha256"]
                 or pointer["manifest_sha256"] != outcome["manifest_sha256"]
                 or pointer["token_after"] != outcome["token_after"]):
@@ -380,3 +407,20 @@ def latest_continuation(task_root, base):
         return outcome
     except (ValueError, TypeError, KeyError, OSError):
         return None
+
+
+def preview_resume(task_root, base):
+    return _preview_resume(task_root, base, owner_guard=_assert_plain_office)
+
+
+def resume_task(task_root, base, expected_token, attempt_id, *, execute=None, deadline=None):
+    return _resume_task(task_root, base, expected_token, attempt_id,
+                        owner_guard=_assert_plain_office, execute=execute, deadline=deadline)
+
+
+def read_resume_result(task_root, base, attempt_id):
+    return _read_resume_result(task_root, base, attempt_id, owner_guard=_assert_plain_office)
+
+
+def latest_continuation(task_root, base):
+    return _latest_continuation(task_root, base, owner_guard=_assert_plain_office)

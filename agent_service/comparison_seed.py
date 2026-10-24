@@ -15,6 +15,7 @@ import time
 from . import computer
 from .computer import ComputerError, digest, read_record, safe_root
 from .computer_goal_adapters import TASK_BASE
+from .verification_progress import checkpoint
 
 MAX_FILES = 256
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -115,6 +116,7 @@ def _validate_shape(value, *, version, require_lifecycle, empty_outputs=False):
 
 
 def _run_root(value):
+    checkpoint()
     root, base = safe_root(value), safe_root(computer.BASE)
     if (root.parent.name != 'goals' or root.parent.parent.parent != base
             or not root.is_dir() or not root.name.endswith('.run')
@@ -124,24 +126,29 @@ def _run_root(value):
 
 
 def _hash(path):
+    checkpoint()
     path = safe_root(path)
     if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
         _fail()
     hashed, size = sha256(), 0
     with path.open('rb') as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
+            checkpoint()
             size += len(block)
             if size > MAX_FILE_BYTES:
                 _fail()
             hashed.update(block)
+    checkpoint(files=1)
     return hashed.hexdigest()
 
 
 def _inventory(root, *, exclude=()):
+    checkpoint()
     root = safe_root(root)
     files, total, entries = {}, 0, 0
     # Bound directories as well as files; links never become a traversal escape.
     for path in root.rglob('*'):
+        checkpoint()
         entries += 1
         if entries > MAX_FILES * 2:
             _fail()
@@ -211,12 +218,23 @@ def _verified(root, frozen):
         ancestor = plan['goal']['comparison']['seed']
         ancestor_root = _run_root(ancestor['run'])
         ancestor_plan = read_record(ancestor_root.with_suffix('.json'))
-        # Only one v4 import layer is supported. Inspect the parent's declared
-        # version before loading, so self/cyclic/deeper imports cannot recurse.
-        if (ancestor_root == root or 'recovery' in ancestor_plan
-                or ancestor_plan.get('goal', {}).get('comparison', {}).get('evidence_version') != 3):
+        # One successful wrapper may use either the legacy v3 source or a
+        # bounded failed graph. Never recurse through arbitrary successful v4s.
+        if ancestor_root == root:
             _fail()
-        # A v4 cache entry depends on its v3 ancestor too. Rehash and validate
+        if type(ancestor.get('version')) is int and ancestor['version'] == 5:
+            ancestor = validate_manifest(ancestor)
+            if any(_run_root(node['snapshot']['run']) == root
+                   for node in ancestor['dependency_graph']['nodes']):
+                _fail()
+            # load_seed below replays the compact graph, including supported
+            # interrupted parents and all imported-capture dependencies.
+            if read_record(ancestor_root / 'outcome.json').get('ok') is not False:
+                _fail()
+        elif ('recovery' in ancestor_plan
+              or ancestor_plan.get('goal', {}).get('comparison', {}).get('evidence_version') != 3):
+            _fail()
+        # A v4 cache entry depends on its source ancestor too. Rehash and validate
         # that original seed before returning any cached child source records.
         load_seed(ancestor)
     key = digest(frozen) if imported is None else digest({'run': frozen, 'capture_import': imported})

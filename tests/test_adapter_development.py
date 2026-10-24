@@ -206,8 +206,9 @@ def test_cancelled_trial_resumes_without_replaying_prefix(tmp_path, monkeypatch)
             workflow._write_new(step_root / "worker-outcome.json", result)
             return result
 
-        from agent_service import office_host
+        from agent_service import office_host, office_readiness
         monkeypatch.setattr(office_host, "execute_office_supervised", supervised)
+        monkeypatch.setattr(office_readiness, "preflight_office_window", lambda: None)
         original = skills.run_skill(store, candidate["id"], task, base,
                                     source_file=source(root), trial_digest=digest,
                                     pause_after_step="s1")

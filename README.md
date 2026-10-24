@@ -13,10 +13,19 @@ Jarvis Desktop Agent is a Windows desktop automation and research service. This 
 - Match supported tasks to existing capabilities, and track adapter drafts through offline checks, review, bounded trials and activation. This does not execute arbitrary generated code.
 - Inspect supported complex Word tables and multi-sheet/formula workbooks, create verified edit copies, and hand supported outputs to another task.
 - Reuse verified captures during comparison recovery and check attribution within the relevant project on supported multi-tenant sites. Missing evidence remains a reason to stop or supplement the research.
+- Plan a bounded route from natural-language instructions and verified artifact metadata: one source, a complete batch table comparison, no source, or clarification. Review and approve the resulting plan before execution; an identical request can reuse its verified preview without another model call.
+- Bring a selected historical batch of 2–4 Word/Excel outputs into supported tasks, compare table text by row and column, and hand new reports directly to the next task. Supported recovery verifies completed steps and continues only the remaining work.
 
-The v4 follow-up backend exists, but its entry point is not yet connected to the main GUI. This is not a general-purpose autonomous computer agent: only implemented workflows and supported sites/apps are in scope.
+Historical comparison follow-up, supported recovery and Office artifact handoff are connected to the main GUI. This is not a general-purpose autonomous computer agent: only implemented workflows and supported sites/apps are in scope. Literal table comparison does not establish semantic equivalence or calculate formulas; general multi-input synthesis and email-content verification remain planned work.
 
-The October 23 source update includes these backend changes and the request-sized budget fix. See [release checks and limits](docs/RELEASE_CHECKS.md); collection of a test is not a passing result, and some private evidence fixtures are intentionally absent.
+The October 24 source update includes natural-language routing, historical Office batches, guarded recovery and handoff improvements. See [release checks and limits](docs/RELEASE_CHECKS.md); development-machine acceptance is distinct from public-snapshot checks, and private evidence fixtures are intentionally absent.
+
+## Core creators
+
+- **[YANGCHUNHONG3000](https://github.com/YANGCHUNHONG3000)** — project initiator, product direction and maintainer.
+- **ChatGPT / Codex (AI development collaborator)** — contributed to architecture, implementation, bug fixes, testing, code review and technical documentation.
+
+This credit records human–AI collaboration. Final project and release decisions remain with the human maintainer.
 
 ## Requirements and setup
 

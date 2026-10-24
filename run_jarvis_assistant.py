@@ -162,6 +162,7 @@ def _resume_reason_label(reason):
         "resume_workflow_invalid": "办公步骤记录无法核验",
         "resume_unknown_effect": "存在结果未知的步骤，需人工核查",
         "resume_skill_owned": "这是受限技能任务；须重核候选并新建任务，不能直接续跑",
+        "resume_bundle_owned": "联合核对任务须由专用恢复路径继续",
         "later_step_conflict": "步骤记录顺序异常，需人工核查",
         "resume_preview_stale": "任务记录已变化，请重新选择并核验",
         "resume_record_invalid": "续跑记录无法核验",
@@ -174,7 +175,9 @@ def _resume_reason_label(reason):
         "skill_resume_changed": "技能实施或已有步骤已变化",
         "skill_resume_plan_changed": "技能来源或固定步骤已变化",
         "skill_resume_source_invalid": "原技能来源无法完整核验",
-        "skill_resume_boundary_invalid": "原任务没有可确认的取消边界",
+        "skill_resume_boundary_invalid": "原任务没有可确认的取消或派发前阻塞边界",
+        "skill_resume_chain_invalid": "技能续跑记录不完整或已变化，需人工核查",
+        "skill_resume_attempt_limit": "本任务已达到技能续跑次数上限，需人工核查",
         "skill_resume_request_invalid": "原技能请求无法核验",
         "skill_resume_cancel_invalid": "原取消记录无法核验",
         "skill_resume_native_unverified": "已有办公成果的应用与文件证据无法核验",
@@ -188,11 +191,53 @@ def _resume_reason_label(reason):
         "unknown_effect": "存在结果未知的步骤，需人工核查",
         "inconsistent_steps": "步骤记录顺序异常，需人工核查",
         "workflow_busy": "另一进程正在处理此工作流",
+        "office_ui_blocked": "Office窗口被对话框阻塞或无响应；请处理该窗口后到历史任务继续。当前步骤尚未派发",
+        "office_ui_unavailable": "暂时无法检查Office窗口；当前步骤尚未派发，请稍后在历史任务重试",
         "stale_preview": "任务记录已变化，请重新选择并核验",
         "cancelled": "已停止", "timed_out": "继续执行超时",
+        "blocked": "等待处理阻塞条件",
         "unknown": "执行结果待核验", "failed": "继续执行未完成",
     }
     return labels.get(reason, "暂不可继续，请核验任务记录")
+
+
+def _resume_handoff_outputs(inspection, outcome, task_root, attempt_id):
+    """Check one reconciled batch in the worker, never trust stdout success."""
+    if (type(inspection) is not dict or type(outcome) is not dict
+            or inspection.get("root") != str(task_root)
+            or outcome.get("task_root") != str(task_root)
+            or outcome.get("attempt_id") != attempt_id
+            or inspection.get("state") == "needs_review"
+            or outcome.get("ok") is not True or outcome.get("state") != "succeeded"):
+        return []
+    records, expected = inspection.get("artifacts"), outcome.get("artifacts")
+    if type(records) is not list or type(expected) is not list:
+        return []
+    # Research's separately verified Markdown stays in history. Only the exact
+    # resumed Office/draft batch is eligible for this next-task handoff.
+    records = [r for r in records if not (type(r) is dict and type(r.get("path")) is str
+               and Path(r["path"]).suffix.lower() == ".md")]
+    if not 1 <= len(records) <= 8 or len(records) != len(expected):
+        return []
+    outputs, labels, paths = [], set(), set()
+    for record, reference in zip(records, expected):
+        if (type(record) is not dict or type(reference) is not dict
+                or type(record.get("label")) is not str or not record["label"]
+                or record["label"] in labels
+                or record.get("path") != reference.get("path")
+                or type(record.get("sha256")) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None
+                or record.get("sha256") != reference.get("sha256")):
+            return []
+        limit = 45_000_000 if str(record.get("path", "")).lower().endswith(".eml") else 20_000_000
+        path = _saved_path(record.get("path"), task_root, record["sha256"], max_bytes=limit)
+        if (path is None or path in paths or path.suffix.lower() not in {".docx", ".xlsx", ".eml"}
+                or path.parent.name != reference.get("step")):
+            return []
+        labels.add(record["label"])
+        paths.add(path)
+        outputs.append((record["label"], path, record["sha256"]))
+    return outputs
 
 
 def _resume_command(task_root, token, attempt_id):
@@ -201,6 +246,12 @@ def _resume_command(task_root, token, attempt_id):
         raise ValueError("resume_argument_invalid")
     return [PYTHON, str(ROOT / "run_jarvis_resume.py"), "--task-root", str(task_root),
             "--token", token, "--attempt-id", attempt_id]
+
+
+def _bundle_resume_command(task_root, token, attempt_id):
+    command = _resume_command(task_root, token, attempt_id)
+    command.insert(2, "--bundle")
+    return command
 
 
 def _skill_resume_command(task_root, token, attempt_id):
@@ -440,11 +491,35 @@ def main(argv=None):
     tabs.add(history_tab, text="历史任务")
     tabs.add(capability_tab, text="本机能力")
     from agent_service.computer_panel import attach_computer_tab
+    def computer_busy_changed(value):
+        active.update(kind='computer' if value else None)
+        notify_goal_external_activity(bool(value), force=bool(value))
+
     computer_panel = attach_computer_tab(tabs, root, busy=lambda: active['kind'] is not None,
-                                        on_busy=lambda value: active.update(kind='computer' if value else None))
+                                        on_busy=computer_busy_changed)
     from agent_service.computer_goal_panel import attach_goal_tab
+    def goal_busy_changed(value):
+        active.update(kind='computer_goal' if value else None)
+        if not value and history_selected.get('inspection') is not None:
+            count = sum(path.suffix.lower() in {'.docx', '.xlsx'}
+                        for path, _sha in history_artifacts.values())
+            history_batch_button.configure(
+                state='normal' if active['kind'] is None and 2 <= count <= 4
+                and not source_choice['pending'] else 'disabled')
+
     goal_panel = attach_goal_tab(tabs, root, busy=lambda: active['kind'] is not None,
-                                on_busy=lambda value: active.update(kind='computer_goal' if value else None))
+                                on_busy=goal_busy_changed)
+
+    def invalidate_history_batch_source(reason):
+        invalidate = getattr(goal_panel, 'invalidate_history_batch_source', None)
+        if callable(invalidate):
+            invalidate(reason)
+
+    def notify_goal_external_activity(active_now=True, force=False):
+        notify = getattr(goal_panel, 'notify_external_activity', None)
+        if callable(notify):
+            notify(active_now, force=force)
+
     from agent_service.mailbox_panel import attach_mailbox_tab
     mailbox_tab = attach_mailbox_tab(tabs, root, lambda snapshot: start_mail_export(snapshot))
     if mailbox_tab is None:
@@ -539,7 +614,7 @@ def main(argv=None):
               wraplength=620).pack(anchor="w", pady=4)
     source_choice = {"path": str(initial_source) if isinstance(initial_source, Path) else "",
                      "artifact_ref": None, "retry_ref": None, "retry_instruction": None,
-                     "retry_changed": False,
+                     "retry_changed": False, "auto_required": False,
                      "generation": 0, "pending": False,
                      "pending_deadline": None, "setting": False}
     skill_gate = {"generation": 0, "id": None, "enabled": False, "digest": None,
@@ -564,6 +639,7 @@ def main(argv=None):
             source_clear.configure(state="normal")
 
     def clear_source_file():
+        source_choice["auto_required"] = False
         source_choice["artifact_ref"] = None
         source_choice["retry_ref"] = None
         source_choice["retry_instruction"] = None
@@ -586,6 +662,7 @@ def main(argv=None):
     source_clear.pack(side="left")
     def source_text_changed(*_):
         if not source_choice["setting"]:
+            source_choice["auto_required"] = False
             if source_choice["retry_ref"] is not None:
                 source_choice["retry_changed"] = True
             source_choice["artifact_ref"] = None
@@ -602,6 +679,7 @@ def main(argv=None):
     source_label.trace_add("write", source_text_changed)
 
     def clear_changed_retry_draft():
+        source_choice["auto_required"] = False
         if source_choice["retry_ref"] is None:
             return
         source_choice["retry_ref"] = None
@@ -707,6 +785,7 @@ def main(argv=None):
         source_generation = source_choice["generation"]
         original_ref = dict(source_ref) if type(source_ref) is dict else None
         skill_gate["enabled"] = False
+        notify_goal_external_activity(True, force=True)
         active.update(kind="skill_preparing", process=None, stop=False,
                       task_root=task_root, stop_deadline=None, attempt_id=None,
                       attempt_root=None, history_id=None,
@@ -784,6 +863,8 @@ def main(argv=None):
             budget_status.set("费用账本暂不可读；模型任务会在预算检查失败时停止。")
 
     def load_history():
+        invalidate_history_batch_source(
+            "历史列表正在刷新；原历史批次已失效，请重新检查并选择。")
         history_scan["generation"] += 1
         generation = history_scan["generation"]
         only_gaps = gap_only.get()
@@ -796,6 +877,8 @@ def main(argv=None):
                              prepare_deadline=None, prepared=False)
             history_resume.configure(state="disabled")
             history_skill_resume.configure(state="disabled")
+            history_bundle_resume.configure(state="disabled")
+            history_batch_button.configure(state="disabled")
             history_prepare.configure(state="disabled")
             history_gap_cancel.configure(state="disabled")
             history_detail.set("正在读取本机任务目录……")
@@ -819,11 +902,22 @@ def main(argv=None):
             return
         selected = history_list.selection()
         if not selected:
+            invalidate_history_batch_source(
+                "历史选择已清除；原历史批次已失效，请重新选择并核验。")
+            history_selected["generation"] += 1
+            history_selected["id"] = None
+            history_selected["inspection"] = None
+            history_artifacts.clear()
+            history_output_list.configure(values=())
+            history_output_choice.set("")
+            history_batch_button.configure(state="disabled")
             return
         task_id = selected[0]
         record = history_records.get(task_id)
         if not record:
             return
+        invalidate_history_batch_source(
+            "历史选择已变化；原历史批次已失效，请重新选择并核验。")
         history_selected["id"] = task_id
         history_selected["generation"] += 1
         gap_state.update(generation=gap_state["generation"] + 1, pending=False,
@@ -838,6 +932,8 @@ def main(argv=None):
         history_dir.configure(state="disabled")
         history_resume.configure(state="disabled")
         history_skill_resume.configure(state="disabled")
+        history_bundle_resume.configure(state="disabled")
+        history_batch_button.configure(state="disabled")
         history_prepare.configure(state="disabled")
         history_gap_cancel.configure(state="disabled")
         history_detail.set(f"{_history_state_label(record.get('state'))} · 正在后台核验成果：{record['root']}")
@@ -918,6 +1014,31 @@ def main(argv=None):
             source_ref_messages.put(("select", generation, origin, selection, None,
                                      "source_artifact_unavailable"))
 
+    def stage_next_office_source():
+        """Stage a visible Office default after success, without starting a task."""
+        if active['kind'] is not None or source_choice['pending']:
+            return False
+        labels = [label for label, path in agent_outputs.items()
+                  if path.suffix.lower() in {'.docx', '.xlsx'}]
+        if not labels:
+            return False
+        label = agent_output_choice.get()
+        if label not in labels:
+            label = labels[0]
+        # A failed automatic check must never leave an older source selected.
+        clear_source_file()
+        source_choice['auto_required'] = True
+        source_choice['path'] = str(agent_outputs[label])
+        source_choice['setting'] = True
+        try:
+            source_label.set(source_choice['path'])
+        finally:
+            source_choice['setting'] = False
+        source_clear.configure(state='normal')
+        agent_output_choice.set(label)
+        select_generated_source('current')
+        return True
+
     def accept_goal_artifacts(records):
         # Called on the Tk thread after the goal worker's receipt/history checks.
         # Next-task selection still uses the existing asynchronous revalidation.
@@ -946,6 +1067,27 @@ def main(argv=None):
         select_generated_source('current')
         load_history()
 
+    def accept_resume_artifacts(outputs):
+        # Batch/path/hash checks ran in finish_resume's background worker.
+        if not outputs or source_choice['pending'] or active['kind'] is not None:
+            return False
+        agent_outputs.clear()
+        agent_output_hashes.clear()
+        for label, path, digest in outputs:
+            agent_outputs[label] = path
+            agent_output_hashes[label] = digest
+        agent_output_list.configure(values=tuple(agent_outputs))
+        office_labels = [label for label, path in agent_outputs.items()
+                         if path.suffix.lower() in {'.docx', '.xlsx'}]
+        label = office_labels[-1] if office_labels else next(iter(agent_outputs))
+        agent_output_choice.set(label)
+        last_paths['agent'] = agent_outputs[label]
+        task_open.configure(state='normal')
+        task_dir.configure(state='normal')
+        if office_labels:
+            return stage_next_office_source()
+        return False
+
     goal_panel.on_artifacts = accept_goal_artifacts
     goal_panel.get_artifacts = lambda: [
         {'path': str(path), 'sha256': agent_output_hashes.get(label)}
@@ -959,6 +1101,31 @@ def main(argv=None):
                    for path, sha in history_artifacts.values() if path.suffix.lower() in {'.docx', '.xlsx'}]
         tabs.select(goal_panel.tab)
         goal_panel.use_generated_artifacts(records)
+
+    def select_history_artifact_batch():
+        if (active['kind'] is not None or source_choice['pending'] or goal_panel.running
+                or history_selected['inspection'] is None):
+            return
+        records = [{'path': str(path), 'sha256': sha}
+                   for path, sha in history_artifacts.values()
+                   if path.suffix.lower() in {'.docx', '.xlsx'}]
+        if not 2 <= len(records) <= 4:
+            history_detail.set('整批能力来源需要同一历史任务的 2 至 4 份 Word/Excel 成果；没有截断或混入其他任务。')
+            return
+        task_id = history_selected['id']
+        selection_generation = history_selected['generation']
+        inspection = history_selected['inspection']
+
+        def is_current():
+            return (active['kind'] in (None, 'computer_goal') and not source_choice['pending']
+                    and history_selected['id'] == task_id
+                    and history_selected['generation'] == selection_generation
+                    and history_selected['inspection'] is inspection)
+
+        if is_current():
+            tabs.select(goal_panel.tab)
+            if not goal_panel.use_history_artifact_batch(task_id, records, is_current):
+                history_detail.set('历史批次选择已变化或成果数量不符合要求；请重新检查后选择。')
 
     ttk.Label(note_tab, text="输入要写入新记事本文档的文字：").pack(anchor="w")
     note_text = tk.Text(note_tab, height=11, wrap="word")
@@ -1031,6 +1198,15 @@ def main(argv=None):
     history_skill_resume = ttk.Button(history_resume_row, text="继续剩余技能步骤", state="disabled",
                                       command=lambda: start_resume(skill=True))
     history_skill_resume.pack(side="left", padx=6)
+    history_bundle_resume = ttk.Button(history_resume_row, text="继续联合核对步骤", state="disabled",
+                                       command=lambda: start_resume(resume_kind="bundle_resume"))
+    history_bundle_resume.pack(side="left", padx=6)
+    history_batch_row = ttk.Frame(history_tab)
+    history_batch_row.pack(fill="x", anchor="w", pady=3)
+    history_batch_button = ttk.Button(
+        history_batch_row, text="整批用于能力模式", state="disabled",
+        command=lambda: select_history_artifact_batch())
+    history_batch_button.pack(side="left")
     history_prepare = ttk.Button(history_resume_row, text="查看候选／准备新任务", state="disabled",
                                  command=lambda: prepare_from_history())
     history_prepare.pack(side="left", padx=6)
@@ -1043,6 +1219,7 @@ def main(argv=None):
 
     def launch(kind, command, task_root=None, attempt_id=None, history_id=None,
                initial_stop=False, resume_kind=None):
+        notify_goal_external_activity(True, force=True)
         active.update(kind=kind, process=None, stop=initial_stop, task_root=task_root,
                       stop_deadline=time.monotonic() + 3 if initial_stop else None,
                       attempt_id=attempt_id,
@@ -1060,6 +1237,7 @@ def main(argv=None):
                             and not initial_stop else "disabled")
         history_resume.configure(state="disabled")
         history_skill_resume.configure(state="disabled")
+        history_bundle_resume.configure(state="disabled")
         history_prepare.configure(state="disabled")
         history_stop.configure(state="normal" if kind == "resume" else "disabled")
         options = dict(cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1137,7 +1315,8 @@ def main(argv=None):
 
     def start_mail_export(snapshot):
         """Accept one already-read mail snapshot; prepare it away from Tk."""
-        if active["kind"] is not None or type(snapshot) is not dict:
+        if (active["kind"] is not None or source_choice["pending"]
+                or type(snapshot) is not dict):
             return False
         task_root = TASK_ROOT / ("task-" + uuid.uuid4().hex)
         last_paths["agent"] = None
@@ -1147,6 +1326,7 @@ def main(argv=None):
         agent_output_choice.set("")
         task_open.configure(state="disabled")
         task_dir.configure(state="disabled")
+        notify_goal_external_activity(True, force=True)
         active.update(kind="mail_export_preparing", process=None, stop=False,
                       task_root=task_root, stop_deadline=None, attempt_id=None,
                       attempt_root=None, history_id=None,
@@ -1159,6 +1339,7 @@ def main(argv=None):
         source_clear.configure(state="disabled")
         history_resume.configure(state="disabled")
         history_skill_resume.configure(state="disabled")
+        history_bundle_resume.configure(state="disabled")
         task_stop.configure(state="normal")
         tabs.select(task_tab)
         task_status.set("正在准备已读邮件的本机 Word 导出；不调用模型、网络或附件下载。")
@@ -1198,6 +1379,10 @@ def main(argv=None):
         if source_choice["pending"]:
             task_status.set("成果来源仍在核验；请等核验完成后再开始任务。")
             return
+        if source_choice["auto_required"]:
+            task_status.set("新成果尚未通过来源核验。请重新点击“用于下一任务”，"
+                            "或明确清除/更换来源；当前不会按无来源任务执行。")
+            return
         retry_ref = source_choice["retry_ref"]
         if retry_ref is not None:
             if (type(retry_ref) is not dict or set(retry_ref) != {"task_root", "token"}
@@ -1209,6 +1394,7 @@ def main(argv=None):
             generation = source_choice["generation"]
             original_ref = dict(retry_ref)
             history_key = (history_selected["id"], history_selected["generation"])
+            notify_goal_external_activity(True, force=True)
             active.update(kind="agent_retry_preparing", process=None, stop=False,
                           task_root=task_root, stop_deadline=None, attempt_id=None,
                           attempt_root=None, history_id=None,
@@ -1246,11 +1432,14 @@ def main(argv=None):
         if artifact_ref is not None:
             if (type(artifact_ref) is not dict or source_label.get() != artifact_ref.get("artifact")):
                 source_choice["artifact_ref"] = None
+                source_choice["auto_required"] = True
+                source_clear.configure(state="normal")
                 task_status.set("成果来源选择已变化；请重新选用成果。尚未调用模型。")
                 return
             task_root = TASK_ROOT / ("task-" + uuid.uuid4().hex)
             generation = source_choice["generation"]
             original_ref = dict(artifact_ref)
+            notify_goal_external_activity(True, force=True)
             active.update(kind="agent_source_preparing", process=None, stop=False,
                           task_root=task_root, stop_deadline=None, attempt_id=None,
                           attempt_root=None, history_id=None,
@@ -1494,7 +1683,7 @@ def main(argv=None):
         history_gap_cancel.configure(state="disabled")
         history_candidate_detail.set("已取消本次只读缺口核验；原任务和当前草稿不变。")
 
-    def start_resume(*, skill=False):
+    def start_resume(*, skill=False, resume_kind=None):
         if active["kind"] is not None:
             return
         task_id = history_selected["id"]
@@ -1503,13 +1692,18 @@ def main(argv=None):
         if not record or type(inspection) is not dict:
             history_resume.configure(state="disabled")
             history_skill_resume.configure(state="disabled")
+            history_bundle_resume.configure(state="disabled")
             return
         preview = inspection.get("resume")
+        requested_kind = resume_kind or ("skill_resume" if skill else "office_resume")
+        preview_kind = preview.get("kind") if type(preview) is dict else None
         if (type(preview) is not dict or preview.get("eligible") is not True
-                or (preview.get("kind") == "skill_resume") is not skill
+                or (preview_kind != requested_kind and not
+                    (requested_kind == "office_resume" and preview_kind is None))
                 or inspection.get("original_state", inspection.get("state")) == "succeeded"):
             history_resume.configure(state="disabled")
             history_skill_resume.configure(state="disabled")
+            history_bundle_resume.configure(state="disabled")
             return
         try:
             from agent_service.task_history import _base, _task
@@ -1521,13 +1715,18 @@ def main(argv=None):
                 raise ValueError("selected_task_changed")
             token = preview["token"]
             attempt_id = uuid.uuid4().hex
-            command = (_skill_resume_command if skill else _resume_command)(
+            command = ({"skill_resume": _skill_resume_command,
+                        "bundle_resume": _bundle_resume_command,
+                        "office_resume": _resume_command}[requested_kind])(
                 task_root, token, attempt_id)
-            attempt_root = task_root / (("skill-resume-" if skill else "resume-") + attempt_id)
-            attempt_root.mkdir(exist_ok=False)
+            attempt_root = task_root / (("skill-resume-" if requested_kind == "skill_resume"
+                                        else "resume-") + attempt_id)
+            if requested_kind != "bundle_resume":
+                attempt_root.mkdir(exist_ok=False)
         except (KeyError, OSError, ValueError):
             history_resume.configure(state="disabled")
             history_skill_resume.configure(state="disabled")
+            history_bundle_resume.configure(state="disabled")
             history_detail.set("任务记录已变化或无法建立续跑记录；请重新选择核验。未执行办公步骤。")
             return
         remaining = preview.get("remaining")
@@ -1539,25 +1738,48 @@ def main(argv=None):
                     and type(total) is int and 0 <= completed <= total else "")
         history_scan["generation"] += 1
         history_selected["generation"] += 1
-        history_detail.set(f"{progress}正在继续 {remaining} 个"
-                           f"{'技能' if skill else '办公'}步骤；本次不调用模型 API。原任务结果保留。")
+        label = {"skill_resume": "技能", "bundle_resume": "联合核对", "office_resume": "办公"}[requested_kind]
+        history_detail.set(f"{progress}正在继续 {remaining} 个{label}步骤；本次不调用模型 API。原任务结果保留。")
         launch("resume", command, task_root=task_root, attempt_id=attempt_id,
-               history_id=task_id, resume_kind="skill_resume" if skill else "office_resume")
+               history_id=task_id, resume_kind=requested_kind)
 
     def stop_resume():
         if active["kind"] != "resume":
             return
         if not active["stop"]:
             active["stop"] = True
-            attempt_root = active.get("attempt_root")
-            try:
-                from agent_service.office_source import _linked
-                if (attempt_root is not None and not _linked(attempt_root)
-                        and not _linked(attempt_root / "cancel.flag") and attempt_root.is_dir()):
-                    (attempt_root / "cancel.flag").touch(exist_ok=True)
-            except OSError:
-                history_detail.set("停止标记未能保存；正在停止本次续跑进程。")
             active["stop_deadline"] = time.monotonic() + 3
+            task_root = active.get("task_root")
+            attempt_id = active.get("attempt_id")
+            attempt_root = active.get("attempt_root")
+            deadline = active["stop_deadline"]
+            if (task_root is not None and isinstance(attempt_id, str)
+                    and attempt_root is not None):
+                def mark_when_attempt_exists():
+                    if (active.get("kind") != "resume" or not active.get("stop")
+                            or active.get("task_root") != task_root
+                            or active.get("attempt_id") != attempt_id
+                            or active.get("attempt_root") != attempt_root
+                            or time.monotonic() > deadline):
+                        return
+                    prefix = "skill-resume-" if active.get("resume_kind") == "skill_resume" else "resume-"
+                    if attempt_root != task_root / (prefix + attempt_id):
+                        return
+                    try:
+                        from agent_service.office_source import _linked
+                        if _linked(attempt_root):
+                            return
+                        if attempt_root.is_dir():
+                            marker = attempt_root / "cancel.flag"
+                            if not _linked(marker):
+                                marker.touch(exist_ok=True)
+                            return
+                        if attempt_root.exists():
+                            return
+                        root.after(100, mark_when_attempt_exists)
+                    except OSError:
+                        history_detail.set("停止标记未能保存；正在停止本次续跑进程。")
+                mark_when_attempt_exists()
             process = active["process"]
             if process is not None and process.poll() is None:
                 threading.Thread(target=terminate_agent_after_grace,
@@ -1650,6 +1872,7 @@ def main(argv=None):
             history_detail.set("历史记录无法核验，请刷新后重新选择。")
             history_resume.configure(state="disabled")
             history_skill_resume.configure(state="disabled")
+            history_bundle_resume.configure(state="disabled")
             history_prepare.configure(state="disabled")
             history_candidate_detail.set("")
             return False
@@ -1661,18 +1884,30 @@ def main(argv=None):
                 if (type(item) is dict and isinstance(item.get("label"), str)
                         and isinstance(item.get("path"), str)
                         and isinstance(item.get("sha256"), str)):
-                    history_artifacts[item["label"]] = (Path(item["path"]), item["sha256"])
+                    label = item["label"]
+                    suffix = 2
+                    while label in history_artifacts:
+                        label = f"{item['label']} [{suffix}]"
+                        suffix += 1
+                    history_artifacts[label] = (Path(item["path"]), item["sha256"])
         labels = tuple(history_artifacts)
         history_output_list.configure(values=labels)
         history_output_choice.set(labels[0] if labels else "")
         history_open.configure(state="normal" if labels else "disabled")
         history_dir.configure(state="normal" if labels else "disabled")
+        office_records = [(path, sha) for path, sha in history_artifacts.values()
+                          if path.suffix.lower() in {".docx", ".xlsx"}]
+        history_batch_button.configure(
+            state="normal" if 2 <= len(office_records) <= 4
+            and active["kind"] is None else "disabled")
         original = result.get("original_state", result.get("state"))
         summary = f"原任务：{_original_state_label(original)} · 已核验成果 {len(labels)} 个"
         continuation = result.get("continuation")
         if type(continuation) is dict:
             state = continuation.get("state")
             summary += " · 续跑：" + ("已完成" if state == "succeeded" else _resume_reason_label(state))
+        if result.get("preflight_block") in {"office_ui_blocked", "office_ui_unavailable"}:
+            summary += " · " + _resume_reason_label(result["preflight_block"])
         preview = result.get("resume")
         eligible = (type(preview) is dict and preview.get("eligible") is True
                     and original != "succeeded"
@@ -1680,11 +1915,16 @@ def main(argv=None):
                     and re.fullmatch(r"[0-9a-f]{64}", preview["token"]) is not None
                     and active["kind"] is None)
         skill_eligible = eligible and preview.get("kind") == "skill_resume"
-        history_resume.configure(state="normal" if eligible and not skill_eligible else "disabled")
+        bundle_eligible = eligible and preview.get("kind") == "bundle_resume"
+        office_eligible = eligible and preview.get("kind") not in {"skill_resume", "bundle_resume"}
+        history_resume.configure(state="normal" if office_eligible else "disabled")
         history_skill_resume.configure(state="normal" if skill_eligible else "disabled")
+        history_bundle_resume.configure(state="normal" if bundle_eligible else "disabled")
         if eligible:
             summary += (f" · 可继续剩余 {preview.get('remaining', '?')} "
-                        f"{'个技能' if skill_eligible else '个办公'}步骤；无需模型 API")
+                        f"{'个技能' if skill_eligible else '个联合核对' if bundle_eligible else '个办公'}步骤；无需模型 API")
+        elif original == "succeeded" and result.get("state") == "succeeded":
+            summary += " · 已完成；可将成果用于下一任务"
         elif type(preview) is dict and result.get("kind") == "office":
             summary += " · " + _resume_reason_label(preview.get("reason"))
             if (preview.get("kind") != "skill_resume"
@@ -1733,12 +1973,17 @@ def main(argv=None):
                     from agent_service.skill_resume import read_resume_result
                     outcome = read_resume_result(
                         task_root, task_root / ("skill-resume-" + attempt_id), TASK_ROOT)
+                elif resume_kind == "bundle_resume":
+                    from agent_service.office_bundle_resume import read_resume_result
+                    outcome = read_resume_result(task_root, TASK_ROOT, attempt_id)
                 else:
                     from agent_service.office_resume import read_resume_result
                     outcome = read_resume_result(task_root, TASK_ROOT, attempt_id)
                 inspection = inspect_task(task_root, TASK_ROOT)
+                handoff = _resume_handoff_outputs(inspection, outcome, task_root, attempt_id)
                 history_messages.put(("resume_final", (task_id, attempt_id),
                                       {"outcome": outcome, "inspection": inspection,
+                                       "handoff": handoff,
                                        "returncode": returncode, "timed_out": timed_out,
                                        "stopped": stopped, "advisory_error": advisory_error,
                                        "resume_kind": resume_kind}))
@@ -1864,8 +2109,8 @@ def main(argv=None):
                     if (error is not None or type(ref) is not dict
                             or ref.get("artifact") != expected_path
                             or ref.get("sha256") != expected_sha):
-                        task_status.set("新成果或办公回执无法核验；原已选来源保持不变。"
-                                        "没有启动任务或调用模型。")
+                        task_status.set("新成果或办公回执无法核验；未带入该成果。"
+                                        "请重新核验，或明确清除来源后再开始新任务。尚未调用模型。")
                         continue
                     source_choice["setting"] = True
                     try:
@@ -1874,12 +2119,16 @@ def main(argv=None):
                         source_choice["setting"] = False
                     source_choice["path"] = ref["artifact"]
                     source_choice["artifact_ref"] = dict(ref)
+                    source_choice["auto_required"] = False
                     source_choice["retry_ref"] = None
                     source_choice["retry_instruction"] = None
                     source_choice["retry_changed"] = False
                     source_clear.configure(state="normal")
-                    task_status.set("已选经核验的 Word/Excel 成果。填写新任务后点击开始；"
-                                    "届时文件内容会提供给云端模型，当前尚未调用。")
+                    draft_note = ("本批邮件草稿仅保存在本机，未发送。"
+                                  if origin == "current" and any(
+                                      p.suffix.lower() == ".eml" for p in agent_outputs.values()) else "")
+                    task_status.set(draft_note + "已选经核验的 Word/Excel 成果。填写新任务后点击开始；"
+                                    "届时文件内容会提供给云端模型，下一任务尚未启动。")
                 elif event == "start":
                     task_root, original_ref, task_instruction = selection
                     if (active["kind"] != "agent_source_preparing"
@@ -1906,13 +2155,8 @@ def main(argv=None):
                             or task_text.get("1.0", "end-1c").strip() != task_instruction):
                         task_status.set("任务内容、成果或办公回执在开始前已变化；未调用模型，请重新选用成果。")
                         source_choice["artifact_ref"] = None
-                        source_choice["setting"] = True
-                        try:
-                            source_label.set("")
-                        finally:
-                            source_choice["setting"] = False
-                        source_choice["path"] = ""
-                        source_clear.configure(state="disabled")
+                        source_choice["auto_required"] = True
+                        source_clear.configure(state="normal")
                         continue
                     try:
                         from agent_service.artifact_source import prepare_artifact_task_root
@@ -2063,6 +2307,7 @@ def main(argv=None):
                 ) and active["kind"] not in {"resume", "resume_verifying"}:
                     history_resume.configure(state="disabled")
                     history_skill_resume.configure(state="disabled")
+                    history_bundle_resume.configure(state="disabled")
                     history_prepare.configure(state="disabled")
                     history_candidate_detail.set("")
                     history_detail.set(f"待核验 · 后台核验未完成（{data}）；未执行任务。")
@@ -2112,7 +2357,7 @@ def main(argv=None):
                                          retry_ref={"task_root": record["root"],
                                                     "token": data["token"]},
                                          retry_instruction=data["instruction"],
-                                         retry_changed=False,
+                                         retry_changed=False, auto_required=False,
                                          generation=source_choice["generation"] + 1)
                     source_clear.configure(state="normal")
                     gap_state["prepared"] = True
@@ -2139,26 +2384,36 @@ def main(argv=None):
                     if event == "resume_final_error":
                         history_resume.configure(state="disabled")
                         history_skill_resume.configure(state="disabled")
+                        history_bundle_resume.configure(state="disabled")
                         history_detail.set("本次续跑结果尚未能核验；请刷新任务历史。已有文件保留。")
                         continue
                     inspection = data.get("inspection")
                     outcome = data.get("outcome")
                     verified = show_history_inspection(inspection)
                     continuation = inspection.get("continuation") if type(inspection) is dict else None
+                    expected_kind = data.get("resume_kind")
+                    kind_matches = (type(outcome) is dict and type(continuation) is dict
+                                    and ((outcome.get("kind") == expected_kind
+                                          and continuation.get("kind") == expected_kind)
+                                         if expected_kind in {"skill_resume", "bundle_resume"}
+                                         else outcome.get("kind") in {None, "office_resume"}
+                                         and continuation.get("kind") in {None, "office_resume"}))
                     complete = (verified and type(outcome) is dict and outcome.get("ok") is True
                                 and outcome.get("state") == "succeeded"
-                                and (data.get("resume_kind") != "skill_resume"
-                                     or outcome.get("kind") == "skill_resume")
                                 and type(continuation) is dict
                                 and continuation.get("attempt_id") == attempt_id
                                 and continuation.get("state") == "succeeded"
-                                and (data.get("resume_kind") != "skill_resume"
-                                     or continuation.get("kind") == "skill_resume"))
+                                and kind_matches)
                     if complete:
                         original_state = inspection.get("original_state", inspection.get("state"))
                         history_detail.set(f"原任务：{_original_state_label(original_state)} · "
                                            "本次续跑已完成并重新核验成果。"
                                            f"已核验 {len(history_artifacts)} 个成果。")
+                        if not data.get("stopped") and not data.get("timed_out"):
+                            if accept_resume_artifacts(data.get("handoff")):
+                                history_detail.set(history_detail.get() + "正在带入下一任务，尚未启动新任务。")
+                            elif not data.get("handoff"):
+                                history_detail.set(history_detail.get() + "自动接力核验未通过，请重新核验成果。")
                     else:
                         state = outcome.get("state") if type(outcome) is dict else "unknown"
                         reason = outcome.get("error", state) if type(outcome) is dict else state
@@ -2219,7 +2474,11 @@ def main(argv=None):
                         last_paths["agent"] = path
                         task_open.configure(state="normal")
                         task_dir.configure(state="normal")
-                        task_status.set("已读邮件已保存为本机 Word 并完成应用回读；正文与元数据已核验，附件内容未保存。")
+                        if not data.get("stopped") and not data.get("timed_out"):
+                            stage_next_office_source()
+                            task_status.set("已读邮件已保存为本机 Word 并完成应用回读；正在核验下一任务来源，附件内容未保存。")
+                        else:
+                            task_status.set("已读邮件已保存为本机 Word 并完成应用回读；收到停止或超时，未自动带入下一任务。")
                     else:
                         task_status.set("本机邮件导出未确认完成；请在历史任务中核验记录。未重新读取邮件或调用模型。")
                     load_history()
@@ -2275,9 +2534,12 @@ def main(argv=None):
                 can_resume = (type(preview) is dict and preview.get("eligible") is True
                               and original_state != "succeeded")
                 skill_preview = can_resume and preview.get("kind") == "skill_resume"
-                history_resume.configure(state="normal" if can_resume and not skill_preview
+                bundle_preview = can_resume and preview.get("kind") == "bundle_resume"
+                office_preview = can_resume and preview.get("kind") in {None, "office_resume"}
+                history_resume.configure(state="normal" if office_preview
                                          else "disabled")
                 history_skill_resume.configure(state="normal" if skill_preview else "disabled")
+                history_bundle_resume.configure(state="normal" if bundle_preview else "disabled")
                 refresh_budget()
                 if kind == "notepad":
                     result = _last_json_lines(output)
@@ -2349,10 +2611,17 @@ def main(argv=None):
                                                 else f"办公工作流已核验 {len(office_outputs)} 个文件；完成步骤 {done_count} 个。选择文件后可打开。")
                             else:
                                 reason = result.get("error") or result.get("state") or "未知状态"
+                                if reason in {"office_ui_blocked", "office_ui_unavailable"}:
+                                    reason = _resume_reason_label(reason)
                                 task_status.set(f"部分完成：已核验 {len(office_outputs)} 个文件，后续步骤未完成（{reason}）。已有成果可以打开。")
                         else:
                             reason = "已停止" if stopped else "超时" if timed_out else result.get("error") or result.get("state") or "没有核验文件"
+                            if reason in {"office_ui_blocked", "office_ui_unavailable"}:
+                                reason = _resume_reason_label(reason)
                             task_status.set(f"Office 任务未完成：{reason}。任务记录：{task_root}")
+                        if (result.get("ok") is True and result.get("state") == "succeeded"
+                                and office_outputs and not stopped and not timed_out):
+                            stage_next_office_source()
                         if was_skill:
                             skill_status.set("本地技能成果已保存并核验；不调用模型。"
                                              if result.get("ok") is True and office_outputs
@@ -2448,6 +2717,7 @@ def main(argv=None):
             task_stop.configure(state="disabled")
             history_resume.configure(state="disabled")
             history_skill_resume.configure(state="disabled")
+            history_bundle_resume.configure(state="disabled")
             history_stop.configure(state="disabled")
             if timed_out_kind == "resume_verifying":
                 history_detail.set("本次续跑结果核验超时；请刷新任务历史查看持久记录。")

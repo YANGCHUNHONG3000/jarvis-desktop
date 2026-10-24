@@ -33,7 +33,7 @@ def _member(value):
 
 
 def enabled(goal):
-    return goal.get('comparison', {}).get('publisher_policy') == POLICY
+    return goal.get('comparison', {}).get('publisher_policy') in {POLICY, 'project_attribution_v6'}
 
 
 def _roster(source, publisher):
@@ -79,8 +79,13 @@ def _roster(source, publisher):
     return name in selected_lines and len(selected_lines) >= 2
 
 
-def role(source, publisher):
+def role(source, publisher, *, policy=POLICY):
     """Return only unambiguous, nonexclusive roles tied to this exact project."""
+    if policy == 'project_attribution_v6':
+        from .hosted_document_policy import role as hosted_role
+        matched = hosted_role(source, publisher)
+        if matched:
+            return matched
     if project_scope(source['url']) is None:
         return None
     text, quote, name = source['text'], publisher['quote'], publisher['name']
@@ -103,16 +108,25 @@ def role(source, publisher):
     return None
 
 
-def compatible(sources, anchors, roles):
+def compatible(sources, anchors, roles, *, policy=POLICY):
     """Several credited people are not several independent publication sources."""
-    scopes = [project_scope(sources[sid]['url']) for sid in anchors]
+    scope_for = project_scope
+    if policy == 'project_attribution_v6':
+        from .hosted_document_policy import scope as hosted_scope
+        scope_for = lambda url: hosted_scope(url) or project_scope(url)
+    scopes = [scope_for(sources[sid]['url']) for sid in anchors]
     return (bool(scopes) and scopes[0] is not None
             and all(scope == scopes[0] for scope in scopes)
             and all(roles.get(sid) in _ROLES for sid in anchors))
 
 
-def candidates(source):
+def candidates(source, *, policy=POLICY):
     """At most two literal role suggestions, never a substituted model verdict."""
+    if policy == 'project_attribution_v6':
+        from .hosted_document_policy import candidates as hosted_candidates
+        matched = hosted_candidates(source)
+        if matched:
+            return matched
     found = []
     def add(name, quote):
         publisher = {'name': name, 'quote': quote}

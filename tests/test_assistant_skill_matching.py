@@ -69,6 +69,10 @@ def test_selected_skill_independent_review_shared_task_and_source(setup):
     assert "local_skill" in client.requests[0]["system"]
     review = json.loads(client.requests[1]["user"])
     assert review["proposed_steps"][0]["data"]["rows"] == [["资料", 3]]
+    coverage = review['source_table_coverage']
+    assert coverage['all_source_retained'] is True and coverage['source_row_count'] == 1
+    assert coverage['source_headers'] == ['项目', '数量'] and coverage['plan_step'] == 's1'
+    assert 'rows' not in coverage and coverage['layout_preserved'] is False
     assert json.loads((Path(result["root"]) / "result.json").read_text(encoding="utf-8")) == result
 
 
@@ -78,6 +82,29 @@ def test_exact_generated_plan_reuses_skill_before_effects(setup):
     result = run(setup, Client(generated, YES_REVIEW))
     assert result["ok"] and result["skill"]["id"] == SELECT["id"] and len(setup[3]) == 1
     assert "skill_exact_plan_matched" in (Path(result["root"]) / "events.jsonl").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize('table', [
+    {'headers': ['changed', 'two'], 'rows': [[1, 2], [3, 4]]},
+    {'headers': ['one', 'two'], 'rows': [[3, 4], [1, 2]]},
+    {'headers': ['one', 'two'], 'rows': [[1, 2]]},
+    {'headers': ['one', 'two'], 'rows': [[True, 2], [3, 4]]},
+])
+def test_literal_table_coverage_rejects_omitted_reordered_or_changed_data(table):
+    snapshot = {'kind': 'table', 'sha256': 'a' * 64,
+                'observed': {'headers': ['one', 'two'], 'rows': [[1, 2], [3, 4]]}}
+    steps = [{'id': 's1', 'action': 'spreadsheet', 'data': table}]
+    with pytest.raises(assistant.AssistantError, match='skill_source_projection_mismatch'):
+        assistant._literal_table_review_coverage(snapshot, steps)
+
+
+def test_false_table_coverage_never_reaches_paid_review_or_executor(setup, monkeypatch):
+    monkeypatch.setattr(skill_matching, 'candidate_plan', lambda *a: [
+        {'id': 's1', 'action': 'spreadsheet', 'data': {'headers': ['项目', '数量'], 'rows': []}}])
+    client = Client(SELECT, YES_REVIEW)
+    result = run(setup, client)
+    assert not result['ok'] and len(client.requests) == 1 and not setup[3]
+    assert result['error'] == 'skill_source_projection_mismatch'
 
 
 def test_different_title_never_substitutes_fixed_skill(setup, monkeypatch):

@@ -5,10 +5,11 @@ from urllib.parse import urlsplit
 from .publisher_scope import POLICY as REPOSITORY_POLICY
 from .project_scope import POLICY as PROJECT_POLICY
 from .project_documents import POLICY as DYNAMIC_POLICY
-from .publisher_roles import POLICY
+from .publisher_roles import POLICY as ROLE_POLICY
+from .hosted_document_policy import POLICY
 
 LEGACY_POLICY = 'explicit_attribution_v1'
-POLICIES = (LEGACY_POLICY, REPOSITORY_POLICY, PROJECT_POLICY, DYNAMIC_POLICY, POLICY)
+POLICIES = (LEGACY_POLICY, REPOSITORY_POLICY, PROJECT_POLICY, DYNAMIC_POLICY, ROLE_POLICY, POLICY)
 REASONS = {
     'title_only': '仅文档或产品标题，未证明发布方',
     'attribution_missing': '缺少具名发布、作者、维护或版权关系',
@@ -30,7 +31,7 @@ def attribution_status(source, publisher, *, policy=None):
     """
     quote = ' '.join(publisher['quote'].split())
     name = ' '.join(publisher['name'].split())
-    if (policy in {PROJECT_POLICY, DYNAMIC_POLICY, POLICY} and 'free software foundation' in name.casefold()
+    if (policy in {PROJECT_POLICY, DYNAMIC_POLICY, ROLE_POLICY, POLICY} and 'free software foundation' in name.casefold()
             and re.search(r'GNU\s+(?:(?:AFFERO|LESSER)\s+)?GENERAL\s+PUBLIC\s+LICENSE',
                           source.get('text', ''), re.I)
             and re.search(r'©|\bcopyright\b', quote, re.I)):
@@ -61,9 +62,9 @@ def attribution_status(source, publisher, *, policy=None):
         return 'title_only'
     if re.search(r'\b(?:not|never|neither|no longer)\b|并非|不是|不由|未经', quote, re.I):
         return 'attribution_missing'
-    if policy == POLICY:
+    if policy in {ROLE_POLICY, POLICY}:
         from .publisher_roles import role
-        if role(source, publisher):
+        if role(source, publisher, policy=policy):
             return 'supported'
     # Bind the claimed name directly to its role, rather than accepting a role
     # elsewhere in the quote (e.g. "Alice. Copyright Bob").
@@ -109,7 +110,7 @@ def review_instructions(goal):
                          'cannot attribute this repository. Links alone do not prove identity. '
                          'Use evidence within the same repository; unsupported hosting platforms '
                          'require attribution on each page itself.')
-    if goal.get('comparison', {}).get('publisher_policy') in {PROJECT_POLICY, DYNAMIC_POLICY, POLICY}:
+    if goal.get('comparison', {}).get('publisher_policy') in {PROJECT_POLICY, DYNAMIC_POLICY, ROLE_POLICY, POLICY}:
         instructions += (' Publisher support cannot cross project boundaries on hosted platforms. '
                          'GitLab includes the full nested namespace; Hugging Face includes model, '
                          'dataset or space type plus owner/repository; Codeberg and GitHub include '
@@ -117,7 +118,7 @@ def review_instructions(goal):
                          'Platform credits, paper citations and license-template authors do not '
                          'establish the project publisher. Links and URL structure are not identity '
                          'evidence. Unknown project scopes require explicit attribution on that page.')
-    if goal.get('comparison', {}).get('publisher_policy') == POLICY:
+    if goal.get('comparison', {}).get('publisher_policy') in {ROLE_POLICY, POLICY}:
         candidate_output = (
             'For THIS policy override the previous publisher output shape on sources with '
             'nonempty candidates: publisher MUST be null or {"candidate_index":0} (or 1), '
@@ -144,6 +145,16 @@ def review_instructions(goal):
                          'do not leave it null because authorship is not legal '
                          'ownership. Prefer the shortest complete candidate sentence over adding '
                          'a second person\'s sentence to its quote.')
+    if goal.get('comparison', {}).get('publisher_policy') == POLICY:
+        instructions += (' Read the Docs hosts distinct projects at distinct project subdomains; '
+                         'sharing readthedocs.io is not evidence of common publication. '
+                         'Still group translations, forks, mirrors and same-project pages together. '
+                         'A complete standalone Author/Authors field naming people is explicit '
+                         'documentation project authorship, including when label, colon and names '
+                         'appear on separate lines. Review these literal candidates even on pages '
+                         'with no dimension quotation. Use candidate_index when candidates exist; '
+                         'do not infer authorship from the page title, hosting provider or URL. '
+                         'Evidence cannot transfer across project subdomains or /projects/ aliases.')
     from .comparison_repair import enabled as repair_policy
     if repair_policy(goal):
         instructions += (' Inspect captured copyright and All rights reserved lines, '

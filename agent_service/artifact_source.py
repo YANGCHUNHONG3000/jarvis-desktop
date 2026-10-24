@@ -71,6 +71,8 @@ def _verified(artifact_path, expected_sha256, base):
         skill_owned = type(parent.get("skill")) is dict
         if skill_owned:
             from .skill_resume import latest_continuation
+        elif 'bundle_sha256' in parent or (task_root / 'bundle-request.json').exists():
+            from .office_bundle_resume import latest_continuation
         else:
             latest_continuation = office_resume.latest_continuation
         prior = latest_continuation(task_root, base)

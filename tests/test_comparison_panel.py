@@ -6,6 +6,7 @@ import pytest
 
 from agent_service import computer_agent, computer_goal_panel as ui
 from agent_service.comparison_panel import build_goal, fields_from_goal
+from agent_service.publisher_evidence import POLICY
 
 
 def values(**extra):
@@ -62,7 +63,9 @@ def panel(hidden_root):
 
 
 def test_mode_appended_and_scope_button_enabled(panel):
-    assert len(ui.MODES) == 11 and ui.MODES[9] == '自然语言编辑 Word/Excel'
+    assert len(ui.MODES) == 12
+    assert ui.MODES[9:] == ('自然语言编辑 Word/Excel', '多结果对比 → Excel → Word',
+                              '根据任务匹配技能／适配器')
     assert str(panel.interaction_button['state']) == 'normal'
     assert '对比' in str(panel.interaction_button['text'])
     assert str(panel.propose_button['state']) == 'disabled'
@@ -113,7 +116,10 @@ def test_preview_is_existing_agent_plan_and_no_model(panel, tmp_path, monkeypatc
     panel.comparison_goal = build_goal(values())
     panel.preview()
     assert panel.session is session and panel.plan['mode'] == 'agent'
-    assert panel.plan['goal'] == panel.comparison_goal
+    expected = build_goal(values())
+    expected['comparison']['publisher_policy'] = POLICY
+    assert panel.plan['goal'] == expected
+    assert panel.comparison_goal == build_goal(values())
     assert panel.plan['instruction'] == '办公键盘对比'
     assert str(panel.execute_button['state']) == 'normal'
     panel.comparison_goal['queries'][0] = 'changed'
@@ -140,7 +146,10 @@ def test_recovery_uses_comparison_mode_and_restores_scope(panel, tmp_path):
         'plan': plan, 'reason': '已恢复预览'}, None))
     panel.poll()
     assert panel.mode.get() == ui.MODES[10]
-    assert panel.comparison_goal == goal and panel.plan == plan
+    expected = build_goal(values())
+    expected['comparison']['publisher_policy'] = POLICY
+    assert plan['goal'] == expected
+    assert panel.comparison_goal == plan['goal'] and panel.plan == plan
     assert build_goal(panel.comparison_fields) == goal
     assert panel.text.get('1.0', 'end-1c') == '继续对比'
 
@@ -245,3 +254,77 @@ def test_invalid_history_clears_source_without_fallback(panel):
     panel.poll()
     assert panel.plan is None and panel.comparison_source is None
     assert panel.comparison_goal is None and '另选来源' in panel.status.get()
+
+
+@pytest.mark.parametrize('operation', ['selection', 'preview'])
+def test_history_progress_is_queued_until_ui_poll(panel, monkeypatch, operation):
+    from agent_service import comparison_history
+    calls = []
+    monkeypatch.setattr(panel, 'start', lambda kind, worker: calls.append((kind, worker)))
+    def verify(*args, stop, progress):
+        assert not stop()
+        progress('正在核验祖先记录')
+    if operation == 'selection':
+        monkeypatch.setattr(comparison_history, 'select_source', verify)
+        panel.select_comparison_source('source.run')
+        expected_kind = 'comparison_source'
+    else:
+        panel.comparison_source = selection()
+        panel.comparison_goal = build_goal(values())
+        panel.session = object()
+        monkeypatch.setattr(comparison_history, 'prepare_selected', verify)
+        panel.preview()
+        expected_kind = 'comparison_preview'
+    assert calls[0][0] == expected_kind
+    panel.set_busy(True)
+    panel.status.set('等待核验')
+    calls[0][1](panel.session)
+    assert panel.status.get() == '等待核验'
+    panel.poll()
+    assert '正在核验祖先记录' in panel.status.get() and '可停止' in panel.status.get()
+    assert panel.running and str(panel.execute_button['state']) == 'disabled'
+
+
+@pytest.mark.parametrize('kind,payload,stopped', [
+    ('comparison_progress', '正在核验文件字节', False),
+    ('comparison_progress', '正在核验文件字节', True),
+    ('progress', {'step': 1, 'total': 2, 'op': 'calculate'}, True),
+    ('progress', {'op': 'agent_cycle', 'message': '正在复核'}, True),
+])
+def test_late_progress_preserves_idle_or_stopped_status(panel, kind, payload, stopped):
+    if stopped:
+        panel.set_busy(True)
+        panel.stop()
+    else:
+        panel.status.set('等待选择来源')
+    status = panel.status.get()
+    panel.messages.put((kind, payload, None))
+    panel.poll()
+    assert panel.status.get() == status
+    assert panel.running is stopped
+
+
+def test_history_cancel_releases_busy_only_on_worker_terminal(panel):
+    panel.set_busy(True)
+    panel.stop()
+    panel.messages.put(('comparison_progress', '正在核验捕获', None))
+    panel.poll()
+    assert panel.running and str(panel.comparison_source_button['state']) == 'disabled'
+    panel.messages.put(('comparison_source', None, 'comparison_selection_cancelled'))
+    panel.poll()
+    assert not panel.running
+    assert panel.comparison_source is None and panel.plan is None
+    assert str(panel.execute_button['state']) == 'disabled'
+    assert str(panel.comparison_source_button['state']) == 'normal'
+    assert '已停止历史来源核验' in panel.status.get()
+    assert 'comparison_selection_cancelled' not in panel.status.get()
+
+
+def test_closed_panel_does_not_consume_history_progress_or_reschedule(panel):
+    panel.set_busy(True)
+    panel.status.set('正在处理')
+    panel.close()
+    panel.messages.put(('comparison_progress', '正在核验捕获', None))
+    panel.poll()
+    assert panel.status.get() == '正在处理'
+    assert panel.poll_id is None and panel.messages.qsize() == 1

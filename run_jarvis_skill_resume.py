@@ -1,4 +1,4 @@
-"""Explicit local continuation of one cancelled, supervised Office skill."""
+"""Explicit continuation of a permitted cancelled or pre-dispatch blocked skill."""
 
 import argparse
 import json
@@ -24,7 +24,7 @@ class _Parser(argparse.ArgumentParser):
 
 
 def main(argv=None, *, repo_root=None):
-    parser = _Parser(description="继续单个已取消的办公技能任务")
+    parser = _Parser(description="继续已获许可的办公技能任务")
     parser.add_argument("--task-root", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--attempt-id", required=True)

@@ -38,7 +38,8 @@ def prepared(tmp_path):
 
 def test_real_edited_source_preserves_every_row_and_reaches_table_copy(prepared):
     task, snapshot, manifest, ref = prepared
-    assert {'generated_edit_table.py', 'computer.py', 'computer_agent_tools.py'} <= set(local_skills._CODE)
+    assert {'generated_edit_table.py', 'computer.py', 'computer_agent_tools.py',
+            'verification_progress.py'} <= set(local_skills._CODE)
     assert snapshot['kind'] == 'table'
     assert snapshot['coverage']['scope'] == 'verified_generated_edited_workbook_data_rows'
     assert len(snapshot['observed']['headers']) == 6
@@ -57,17 +58,29 @@ def test_real_edited_source_preserves_every_row_and_reaches_table_copy(prepared)
 
 @pytest.mark.parametrize('change', [
     {'sheet': 'Data', 'cell': 'A1', 'before': 1, 'after': 2},
-    {'sheet': 'Data', 'cell': 'A2', 'before': 1, 'after': 2},
+    {'sheet': 'Data', 'cell': 'C2', 'before': 1, 'after': 2},
     {'sheet': 'Data', 'cell': 'A4', 'before': 1, 'after': 2},
     {'sheet': 'Data', 'cell': 'C3', 'before': 1, 'after': 2},
     {'sheet': 'Other', 'cell': 'A3', 'before': 1, 'after': 2},
 ])
-def test_only_exact_data_cells_can_be_transferred(change):
+def test_only_exact_header_and_data_cells_can_be_transferred(change):
     original = {'headers': ['one', 'two'], 'rows': [[1, 2]]}
     before = deepcopy(original)
     with pytest.raises(ValueError, match='edited_table_scope_invalid'):
         generated_edit_table._apply_changes(original, [change], 'Data')
     assert original == before
+
+
+def test_approved_header_and_data_edits_preserve_full_table():
+    original = {'headers': ['one', 'two'], 'rows': [[1, 2]]}
+    table = generated_edit_table._apply_changes(original, [
+        {'sheet': 'Data', 'cell': 'B2', 'before': 'two', 'after': '证据来源页面'},
+        {'sheet': 'Data', 'cell': 'A3', 'before': 1, 'after': 3}], 'Data')
+    assert table == {'headers': ['one', '证据来源页面'], 'rows': [[3, 2]]}
+    assert original == {'headers': ['one', 'two'], 'rows': [[1, 2]]}
+    with pytest.raises(ValueError, match='edited_table_before_mismatch'):
+        generated_edit_table._apply_changes(original, [
+            {'sheet': 'Data', 'cell': 'B2', 'before': 'forged', 'after': 'new'}], 'Data')
 
 
 def test_changed_before_value_is_rejected_without_mutating_table():
@@ -76,6 +89,78 @@ def test_changed_before_value_is_rejected_without_mutating_table():
         generated_edit_table._apply_changes(table, [{'sheet': 'Data', 'cell': 'B3',
             'before': 99, 'after': 3}], 'Data')
     assert table['rows'] == [[1, 2]]
+
+
+@pytest.fixture
+def derived_header_chain(tmp_path, monkeypatch):
+    from agent_service import edited_artifact_source
+    origin = tmp_path / ('task-' + '0' * 32) / ('workflow-' + '1' * 32) / 's1/spreadsheet.xlsx'
+    paths = [tmp_path / ('task-' + str(n) * 32) / 'edit/edited-spreadsheet.xlsx'
+             for n in (2, 3)]
+    refs = [{'artifact': str(path), 'sha256': str(n) * 64} for n, path in enumerate(paths, 2)]
+    specs = [{'kind': 'spreadsheet', 'changes': [
+        {'sheet': 'Data', 'cell': 'B2', 'before': 'two', 'after': '证据来源页面'}]},
+        {'kind': 'spreadsheet', 'changes': [
+            {'sheet': 'Data', 'cell': 'B2', 'before': '证据来源页面', 'after': '来源页面'},
+            {'sheet': 'Data', 'cell': 'A3', 'before': 1, 'after': 9}]}]
+    roots = [tmp_path / 'source-1', tmp_path / 'source-2']
+    monkeypatch.setattr(edited_artifact_source, 'prepare_reference',
+                        lambda path, digest, base: refs[paths.index(Path(path))])
+    monkeypatch.setattr(generated_edit_table, '_load', lambda path: (
+        {'spec': specs[paths.index(path.parent / 'edited-spreadsheet.xlsx')],
+         'source_root': str(roots[paths.index(path.parent / 'edited-spreadsheet.xlsx')])}, ''))
+    monkeypatch.setattr(generated_edit_table, 'verify_edit_source', lambda path: {
+        'sha256': refs[0]['sha256'], 'observed': {'sheets': [{'name': 'Data'}]}})
+    monkeypatch.setattr(generated_edit_table, '_read', lambda path: {
+        'original': str(origin if path.parent == roots[0] else paths[0])})
+    monkeypatch.setattr(artifact_source, '_verified', lambda *a: ({'artifact': str(origin)}, {}, {}, 0))
+    monkeypatch.setattr(artifact_source, '_extract', lambda *a: (
+        'table', {'headers': ['one', 'two'], 'rows': [[1, 2]]}, {}))
+    return refs, specs, tmp_path
+
+
+def test_header_chain_coverage_and_order(derived_header_chain):
+    refs, specs, base = derived_header_chain
+    _, edits, table, coverage = generated_edit_table._derive(refs[-1], base)
+    assert edits == refs and table == {'headers': ['one', '来源页面'], 'rows': [[9, 2]]}
+    assert coverage == {'scope': 'verified_generated_edited_workbook_headers_and_data',
+        'rows': 1, 'columns': 2, 'title_row_excluded': True, 'totals_row_excluded': True,
+        'edited_data_cells': 1, 'edited_header_cells': 2, 'edit_depth': 2}
+    specs[-1]['changes'][0]['before'] = 'two'
+    with pytest.raises(ValueError, match='edited_table_before_mismatch'):
+        generated_edit_table._derive(refs[-1], base)
+
+
+@pytest.mark.parametrize('after', [None, 7, '', '  ', 'line\nbreak', 'x' * 2001])
+def test_invalid_header_rejected_by_existing_writer_contract(derived_header_chain, after):
+    refs, specs, base = derived_header_chain
+    specs[0]['changes'][0]['after'] = after
+    with pytest.raises(ValueError, match='source_writer_unsupported'):
+        generated_edit_table._derive(refs[0], base)
+
+
+def test_real_header_edit_reaches_report_without_losing_evidence(tmp_path):
+    edited = BASE / 'task-b5eff3cee4b3488d9c8a411a52cfecd0/edit/edited-spreadsheet.xlsx'
+    if not edited.is_file():
+        pytest.skip('§77 preserved native header edit unavailable')
+    digest = sha256(edited.read_bytes()).hexdigest()
+    ref = prepare_reference(edited, digest, BASE)
+    task = tmp_path / 'task'
+    task.mkdir()
+    snapshot = generated_edit_table.snapshot_if_generated(ref, task, BASE)
+    checked = local_skills._prepared_snapshot(task, snapshot, BASE)
+    assert checked['observed']['headers'][0] == '证据来源页面'
+    assert checked['coverage']['edited_header_cells'] == 1
+    assert checked['coverage']['edited_data_cells'] == 0
+    assert len(checked['observed']['rows']) == 5
+    candidate = {'schema': 1, 'id': 'evidence-table-report', 'version': 1,
+        'name': '证据来源表原文转存报告', 'recipe': 'table_report', 'sum_columns': [], 'draft': False}
+    steps = local_skills.build_steps(candidate, checked)
+    assert len(steps) == 2 and steps[1]['action'] == 'document_from_sheet'
+    assert steps[0]['data']['headers'] == checked['observed']['headers']
+    assert steps[0]['data']['rows'] == checked['observed']['rows']
+    assert steps[0]['data']['sum_columns'] == []
+    assert sha256(edited.read_bytes()).hexdigest() == digest
 
 
 @pytest.mark.parametrize('target', ['provenance', 'source_record', 'copied_bytes'])

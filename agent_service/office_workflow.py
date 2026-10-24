@@ -393,9 +393,12 @@ def run_office_workflow(steps, root: Path, *, execute=None, resume=False,
                 or result_root.resolve().parent != workflow_root.parent
                 or cancel_file != result_root / "cancel.flag"):
             raise WorkflowError("resume_scope_invalid")
+    readiness = None
     if execute is None:
         from .office_host import execute_office_supervised
         from .email_draft import execute_draft
+        from .office_readiness import preflight_office_window
+        readiness = preflight_office_window
 
         def execute(spec, step_root, should_stop):
             if spec["kind"] == "email_draft":
@@ -465,6 +468,16 @@ def run_office_workflow(steps, root: Path, *, execute=None, resume=False,
                 return partial("unknown", step=step["id"])
             if stop():
                 return partial("cancelled" if cancelled() else "timed_out")
+            if readiness is not None and spec["kind"] != "email_draft":
+                try:
+                    blocked = readiness()
+                except Exception:
+                    blocked = "office_ui_unavailable"
+                if stop():
+                    return partial("cancelled" if cancelled() else "timed_out")
+                if blocked is not None:
+                    code = blocked if type(blocked) is str and blocked in {"office_ui_blocked", "office_ui_unavailable"} else "office_ui_unavailable"
+                    return partial("failed", step=step["id"], error=code)
             step_root.mkdir(exist_ok=False)
             _write_new(intent_path, {"step_id": step["id"], "input_sha256": spec_hash})
             if stop():
