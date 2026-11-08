@@ -308,6 +308,10 @@ def inspect_task(task_root, base):
         return output
     result = _json_small(root / "result.json")
     state, kind = _metadata(result, root)
+    mail_owned = (any((root / name).exists() for name in (
+        'mail-analysis-request.json', 'mail-analysis-claim.json', 'mail-review-resume.json'))
+        or type(result) is dict and ('mail_understanding' in result or 'mail_review_resume' in result)
+        or (Path(base) / '.mail-review-resumes' / 'children' / (root.name + '.json')).exists())
     bundle_owned = (type(result) is dict and 'bundle_sha256' in result) or (root / 'bundle-request.json').exists()
     if bundle_owned:
         try:
@@ -331,6 +335,17 @@ def inspect_task(task_root, base):
             if workflow_root is None:
                 output["state"] = "needs_review"
                 return output
+            if mail_owned:
+                # A failed resume preview must not fall through to displaying
+                # workflow receipts from a different or no-longer-bound mail task.
+                try:
+                    from .mail_understanding import verify_task
+                    manifest = _json_small(workflow_root / 'manifest.json', workflow._MAX_JSON)
+                    verify_task(root, base, manifest['steps'], parent=result)
+                except (OSError, ValueError, UnicodeError, KeyError, TypeError):
+                    output.update(state='needs_review', original_state=state,
+                                  resume={'eligible': False, 'reason': 'mail_analysis_binding_invalid'})
+                    return output
             output["workflow_root"] = str(workflow_root)
             verified = _verified_workflow(workflow_root)
             if verified is None:
@@ -414,6 +429,10 @@ def inspect_task(task_root, base):
 
     # Without a final assistant result, only one owned Office workflow can be
     # identified unambiguously. A verified final step is not task success.
+    if mail_owned:
+        output.update(state='needs_review', kind='office',
+                      resume={'eligible': False, 'reason': 'mail_analysis_binding_invalid'})
+        return output
     workflow_root = _single_workflow(root)
     if workflow_root is None:
         return output

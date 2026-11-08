@@ -114,6 +114,8 @@ def _verify_eml(path: Path, draft: dict, attachments: list[dict]):
         raise DraftError("draft_mime_invalid")
     if str(message["Subject"]) != draft["subject"]:
         raise DraftError("draft_subject_mismatch")
+    if any(header in message for header in ("Cc", "Bcc", "Resent-To", "Resent-Cc", "Resent-Bcc")):
+        raise DraftError("draft_recipient_mismatch")
     expected_to = draft["to"]
     actual_to = getaddresses(message.get_all("To", []))
     if actual_to != [("", item) for item in expected_to]:

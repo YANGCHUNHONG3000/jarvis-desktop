@@ -6,19 +6,19 @@ Jarvis Desktop Agent is a Windows desktop automation and research service. This 
 
 ## What it can do
 
-- Search the web, inspect and summarize pages, and perform bounded browser input, clicks, and reads on supported sites. Sign-in and CAPTCHA steps are manual.
-- Create, edit, verify, and hand off native WPS Writer and Spreadsheets documents through Windows COM automation.
-- Preserve durable receipts for supported workflows. When an external action may have happened but cannot be verified, the result is marked unknown and that action is not replayed automatically.
-- Compare claims with quoted passages and publisher evidence. This is evidence checking, not a guarantee that a claim is true.
-- Match supported tasks to existing capabilities, and track adapter drafts through offline checks, review, bounded trials and activation. This does not execute arbitrary generated code.
-- Inspect supported complex Word tables and multi-sheet/formula workbooks, create verified edit copies, and hand supported outputs to another task.
-- Reuse verified captures during comparison recovery and check attribution within the relevant project on supported multi-tenant sites. Missing evidence remains a reason to stop or supplement the research.
-- Plan a bounded route from natural-language instructions and verified artifact metadata: one source, a complete batch table comparison, no source, or clarification. Review and approve the resulting plan before execution; an identical request can reuse its verified preview without another model call.
-- Bring a selected historical batch of 2–4 Word/Excel outputs into supported tasks, compare table text by row and column, and hand new reports directly to the next task. Supported recovery verifies completed steps and continues only the remaining work.
+- Search and inspect supported websites, check claims against quoted evidence, and create source-linked reports. Sign-in and CAPTCHA require local manual input.
+- Create, edit, verify and hand off supported WPS Word/Excel documents, including bounded table and multi-sheet workflows. Natural-language edits use observed locations, a reviewed plan, preserved originals and native readback.
+- Carry verified Office outputs into the next task; supported recovery rechecks completed steps and runs only the remaining work.
+- Split a supported Office-plus-Windows instruction into a bounded 2–4-step checklist. Review the split and each step before execution; verified Office output batches carry forward, and supported recovery continues unfinished steps.
+- Observe supported Windows windows and controls, propose bounded goals, and select a compatible native, Winapp or Windows-MCP executor. Receipts record the selected route; an unknown external effect stops execution without automatic replay.
+- Use optional selected-window image assistance for reviewed candidates. Image assistance requires explicit opt-in; it does not authorize arbitrary screen coordinates.
+- Match tasks to reviewed capabilities and manage adapter drafts through offline checks, review, bounded trials and activation.
 
-Historical comparison follow-up, supported recovery and Office artifact handoff are connected to the main GUI. This is not a general-purpose autonomous computer agent: only implemented workflows and supported sites/apps are in scope. Literal table comparison does not establish semantic equivalence or calculate formulas; general multi-input synthesis and email-content verification remain planned work.
+These implemented workflows are bounded by their supported source, application and evidence contracts. General desktop autonomy, arbitrary generated-code execution, arbitrary document layouts and a complete voice-integrated assistant remain outside this desktop release. Missing or changed evidence can require clarification or stop execution.
 
-The October 24 source update includes natural-language routing, historical Office batches, guarded recovery and handoff improvements. See [release checks and limits](docs/RELEASE_CHECKS.md); development-machine acceptance is distinct from public-snapshot checks, and private evidence fixtures are intentionally absent.
+Office execution also requires the existing reviewed adapter qualification or bounded trial allowance. A completed demonstration does not grant unlimited activation; an exhausted allowance stops new execution until the qualification/activation process is completed.
+
+The current update adds guarded Windows providers, natural-language Office editing and verified continuation. See [release checks and limits](docs/RELEASE_CHECKS.md). Development-machine acceptance and public-snapshot checks are recorded separately; private evidence fixtures are absent.
 
 ## Core creators
 
@@ -35,11 +35,11 @@ Fresh-machine installation has not been verified. Word and Excel COM compatibili
 
 ## Cloud model and spending controls
 
-Cloud model calls are disabled by default unless a local owner-created permission file allows them. When enabled, the required permission values are `authorized: true`, `daily_limit_cny: "5.00"`, and `timezone: "America/New_York"`. This authorizes sending the selected request content to the configured model provider; review what a task may include before enabling it. The local API key belongs in the ignored `DEEPSEEK_API_KEY.txt` file and must never be committed.
+Cloud calls require an owner-created local permission file and a local API key. Supported DeepSeek and OpenAI paths share one persistent usage/cost ledger. Selected task text, and an explicitly enabled window image where applicable, may be sent to the configured provider.
 
-The budget ledger enforces both a New York calendar-day cap and a rolling 24-hour cap of CNY 5. Unresolved reservations remain held against both limits. The cap is a spending ceiling, not a promise of free use or an estimate of remaining balance.
+Local authorization supports `limited` mode (CNY 5 for both the New York calendar day and rolling 24 hours) or explicitly authorized `unlimited` mode (no local amount cap). Unlimited mode does not provide provider credits or remove platform quotas. Accounting failures still stop calls, and unknown reservations remain held. Do not replace the ledger or clear unresolved holds to bypass a stop.
 
-Reservations use a conservative bound for the actual text request plus its output limit, rather than reserving the model's entire context window. Credible usage outside that bound is accounted for and blocks subsequent paid calls until investigated. Do not clear unresolved holds or replace the ledger to bypass a stop.
+Keys and permission files must stay local and uncommitted. See [Quickstart](docs/QUICKSTART.md) for the configuration contract. Cost estimates are conservative local accounting, not a provider invoice.
 
 ## License and status
 

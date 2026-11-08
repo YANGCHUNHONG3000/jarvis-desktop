@@ -150,6 +150,9 @@ def _snapshot(task_root, base):
         receipt_hashes.append([step_id, sha256(raw).hexdigest(), receipt["sha256"]])
     token_data = {"original": original_hash, "manifest": manifest_hash,
                   "receipts": receipt_hashes}
+    if 'mail_understanding' in result or (root / 'mail-analysis-claim.json').exists():
+        from .mail_understanding import verify_task
+        token_data['mail_understanding'] = verify_task(root, base, steps, result)
     token = workflow._hash(token_data)
     if 'bundle_sha256' in result or (root / 'bundle-request.json').exists():
         from .office_bundle import verify_task

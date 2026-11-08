@@ -1,10 +1,13 @@
 """Synthetic, offline evidence for explicit read-mail to local Word export."""
 
+from copy import deepcopy
 from hashlib import sha256
+from html import escape
 import json
 from pathlib import Path
 import time
 import uuid
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
@@ -96,7 +99,7 @@ def test_snapshot_rejects_unknown_fields(extra):
 def test_snapshot_rejects_unbounded_or_incomplete_message_without_truncation():
     for changes in (
         {"body": "X" * 3001},
-        {"body": "\n" * 40},
+        {"body": "\n" * 311},
         {"body": "bad\x00text"},
         {"coverage": {**snapshot()["coverage"], "scope": "header_only"}},
         {"coverage": {**snapshot()["coverage"], "body_format": "none"}},
@@ -122,6 +125,76 @@ def test_html_extraction_and_attachment_metadata_are_explicit(tmp_path):
     assert "从 HTML 提取的纯文本" in text
     assert "附件内容未保存" in text
     assert "HTML 提取正文" in text
+
+
+def test_184_line_export_preserves_blanks_attachment_request_and_mail_source(tmp_path):
+    """Offline OOXML executor verifies provenance; it is not native Office evidence."""
+    from agent_service import artifact_source, mail_export, mail_understanding
+
+    lines = ["" if index % 17 == 0 else f"第{index}行：保留原文\t列🙂"
+             for index in range(183)] + [""]
+    original = snapshot(body="\r\n".join(lines))
+    before = deepcopy(original)
+    canonical = json.dumps(original, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":")).encode("utf-8")
+    spec = mail_export._document_spec(original)
+    expected_body = [line.replace("\t", "    ") for line in lines]
+    assert len(lines) == 184 and lines[-1] == ""
+    assert spec["paragraphs"][8:8 + len(lines)] == expected_body
+    assert len(spec["paragraphs"]) == 194
+    assert "附件内容未保存" in spec["paragraphs"][-2]
+    assert "安排.pdf" in spec["paragraphs"][-1]
+    root, base = task(tmp_path)
+    digest = write_export_request(root, base, original)
+    request = root / "mail-export-request.json"
+    request_before = request.read_bytes()
+    saved = json.loads(request_before)
+    assert sha256(request_before).hexdigest() == digest
+    assert saved["snapshot"] == before
+    assert saved["snapshot_sha256"] == sha256(canonical).hexdigest()
+
+    def offline_ooxml(specification, step_root, stop):
+        assert stop() is False
+        assert specification == spec
+        path = step_root / "document.docx"
+        paragraphs = "".join(
+            '<w:p><w:r><w:t xml:space="preserve">' + escape(text)
+            + '</w:t></w:r></w:p>'
+            for text in [specification["title"], *specification["paragraphs"]])
+        xml = ('<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+               '<w:body>' + paragraphs + '<w:sectPr/></w:body></w:document>')
+        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("word/document.xml", xml.encode("utf-8"))
+        return {"ok": True, "state": "succeeded", "artifact": str(path),
+                "sha256": sha256(path.read_bytes()).hexdigest(),
+                "observed": {"text": "\n".join([specification["title"],
+                                                *specification["paragraphs"]])},
+                "app": {"progid": "offline-test", "name": "offline test", "version": "1"},
+                "application_verified": True, "file_verified": True}
+
+    result = run_mail_export(root, base, digest, execute=offline_ooxml)
+    assert result["ok"] is True
+    ref = artifact_source.prepare_artifact_source(result["artifact"],
+                                                  result["readback_sha256"], base)
+    loaded = mail_understanding.load_mail(ref, base)
+    assert loaded == before == original
+    assert loaded["body"] == before["body"]
+    assert loaded["sha256"] == before["sha256"]
+    assert request.read_bytes() == request_before
+    assert mail_understanding.context(loaded)["body_lines"] == {
+        f"B{index}": line for index, line in enumerate(lines, 1)}
+
+
+@pytest.mark.parametrize("line_count", [310, 311])
+def test_export_paragraph_capacity_includes_headers_and_attachment(line_count):
+    from agent_service.mail_export import _document_spec
+
+    selected = snapshot(body="\n".join(["正文"] * line_count))
+    if line_count == 310:
+        assert len(_document_spec(validate_snapshot(selected))["paragraphs"]) == 320
+    else:
+        with pytest.raises(MailExportError, match="mail_export_document_limit"):
+            validate_snapshot(selected)
 
 
 def test_request_hash_and_replay_block_before_effect(tmp_path):

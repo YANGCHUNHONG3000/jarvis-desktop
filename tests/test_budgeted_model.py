@@ -217,6 +217,21 @@ def test_permission_missing_blocks_all_http_even_with_fake_key(local_client):
     assert ledger.snapshot()["held_micro"] == 0
 
 
+def test_production_ledger_cannot_use_different_permission(local_client, tmp_path, monkeypatch):
+    from agent_service import budget, model_policy
+    make, ledger, custom_permission = local_client
+    global_permission = tmp_path / 'global-permission.json'
+    global_permission.write_text(json.dumps({'authorized': True, 'timezone': 'America/New_York',
+        'budget_mode': 'unlimited', 'daily_limit_cny': None, 'rolling_limit_cny': None}), encoding='utf-8')
+    monkeypatch.setattr(budget, 'DEFAULT_LEDGER', ledger.path)
+    monkeypatch.setattr(model_policy, 'PERMISSION', global_permission)
+    session = FakeSession()
+    with pytest.raises(ModelError, match='model_permission_mismatch'):
+        make(session).complete('JSON', 'one step')
+    assert session.gets == session.posts == []
+    assert custom_permission.is_file()
+
+
 @pytest.mark.parametrize("usage", [{},
                                     {"prompt_tokens": 10, "completion_tokens": 5,
                                      "total_tokens": 14},
@@ -267,7 +282,7 @@ def test_max_tokens_boundary_and_six_call_ceiling(local_client, monkeypatch):
     from agent_service import model
 
     make, ledger, _ = local_client
-    for bad in (0, 2049, 1.0, True):
+    for bad in (0, 8193, 1.0, True):
         session = FakeSession()
         with pytest.raises(ModelError, match="model_input_invalid"):
             make(session).complete("system", "user", max_tokens=bad)

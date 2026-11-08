@@ -112,7 +112,21 @@ def test_no_effect_cancel_can_resume_untouched_original_edits(ctx):
 
 
 def test_continuation_cannot_reset_existing_session_model_call_cap(ctx):
-    prior = run(ctx,prepare(ctx,browser=None),stop=lambda:True)
+    from test_browser_checkpoint_recovery import ProvenBrowser
+    # Generic browser tasks still choose between the two Office actions after
+    # a verified page capture. Stop before that choice, then resume at the cap.
+    browsers = []
+    def factory(config, **options):
+        browser = ProvenBrowser(config, **options)
+        browsers.append(browser)
+        return browser
+    def progress(value):
+        if value.get('op') == 'agent_cycle' and browsers and browsers[0].phase == 2:
+            ctx['stopped'][0] = True
+    prior = run(ctx,prepare(ctx),browser_factory=factory,progress=progress)
+    ctx['stopped'][0] = False
+    assert prior['code'] == 'goal_cancelled' and prior['actions'] == 2
+    assert recovery.inspect(ctx['session'],prior['run'])['eligible']
     for n in range(6):
         ctx['session'].claim_model({'prior':n})
     reopened = ComputerSession(ctx['session'].root)

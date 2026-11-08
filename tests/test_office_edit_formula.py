@@ -44,7 +44,7 @@ def copied(tmp_path):
     return original, output, observed, spec
 
 
-def install_native(monkeypatch, observed, *, bad_result=False):
+def install_native(monkeypatch, observed, *, bad_result=False, stale=False, wrong_book=False):
     expected, order = edit._formula_expectations(observed)
     calls = []
     sheets = {}
@@ -57,14 +57,26 @@ def install_native(monkeypatch, observed, *, bad_result=False):
             value = expected[key] if formula else cell["value"]
             if bad_result and key == ("汇总", "A1"):
                 value = 999
-            ranges[cell["cell"]] = SimpleNamespace(
-                Formula=native_formula, Value2=value,
-                Calculate=lambda key=key: calls.append(key))
+            target = SimpleNamespace(Formula=native_formula, Value2=-1 if stale and formula else value, dirty=False)
+            def dirty(target=target,key=key):
+                target.dirty=True
+                calls.append(('dirty',key))
+            def calculate(target=target,key=key,value=value):
+                calls.append(key)
+                if target.dirty:
+                    target.Value2=value
+            target.Dirty=dirty
+            target.Calculate=calculate
+            ranges[cell["cell"]] = target
         sheets[sheet["name"]] = SimpleNamespace(Range=lambda coordinate, ranges=ranges: ranges[coordinate])
     owned = SimpleNamespace(Worksheets=SimpleNamespace(
         Count=len(sheets), Item=lambda name: sheets[name]),Close=lambda save: calls.append(('close',save)))
+    def open_book(path, **kwargs):
+        assert kwargs=={'UpdateLinks':0,'ReadOnly':True}
+        owned.FullName=path+'.wrong.xlsx' if wrong_book else path
+        return owned
     app = SimpleNamespace(Name="simulated COM protocol", Version="test-only",
-                          Workbooks=SimpleNamespace(Open=lambda *args, **kwargs: owned))
+                          Workbooks=SimpleNamespace(Open=open_book))
     client = SimpleNamespace(DispatchEx=lambda progid: app)
     monkeypatch.setitem(sys.modules, "pythoncom", SimpleNamespace(
         CoInitialize=lambda: None, CoUninitialize=lambda: None))
@@ -93,7 +105,7 @@ def test_native_formula_recalculation_and_value_proof(tmp_path, monkeypatch):
     _, output, observed, spec = copied(tmp_path)
     calls, order = install_native(monkeypatch, observed)
     receipt = edit._native_readback(output, spec, observed, lambda: None)
-    assert calls == order + [('close',False)]
+    assert calls == [value for key in order for value in [('dirty',key),key]] + [('close',False)]
     assert receipt["calculation"] == "owned_formula_ranges_in_dependency_order"
     assert receipt["stored_formula_caches"] == "unchanged_in_output_package"
     assert receipt["formula_results"][-1] == {"sheet": "汇总", "cell": "A1",
@@ -105,6 +117,24 @@ def test_native_formula_result_mismatch_rejected(tmp_path, monkeypatch):
     install_native(monkeypatch, observed, bad_result=True)
     with pytest.raises(edit.EditError, match="edit_application_mismatch"):
         edit._native_readback(output, spec, observed, lambda: None)
+
+
+def test_native_stale_formula_cache_is_dirtied_before_calculation(tmp_path, monkeypatch):
+    _,output,observed,spec=copied(tmp_path)
+    before=output.read_bytes()
+    calls,order=install_native(monkeypatch,observed,stale=True)
+    receipt=edit._native_readback(output,spec,observed,lambda:None)
+    assert [r['native_result'] for r in receipt['formula_results']]==[35,75,37.5]
+    assert calls==[v for key in order for v in [('dirty',key),key]]+[('close',False)]
+    assert output.read_bytes()==before
+
+
+def test_native_wrong_workbook_identity_stops_before_dirty(tmp_path, monkeypatch):
+    _,output,observed,spec=copied(tmp_path)
+    calls,_=install_native(monkeypatch,observed,wrong_book=True)
+    with pytest.raises(edit.EditError,match='edit_application_mismatch'):
+        edit._native_readback(output,spec,observed,lambda:None)
+    assert calls==[('close',False)]
 
 
 @pytest.mark.parametrize("formula", ["=WEBSERVICE(1)", "=[other.xlsx]Sheet1!B1",

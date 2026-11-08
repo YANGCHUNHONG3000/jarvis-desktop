@@ -12,6 +12,15 @@ import pytest
 import run_jarvis_assistant as launcher
 
 
+def _replace_package_module(monkeypatch, qualified_name, module):
+    """Replace an imported test module without leaving a stale package attribute."""
+    package_name, _, attribute = qualified_name.rpartition(".")
+    package = sys.modules.get(package_name)
+    if package is not None:
+        monkeypatch.setattr(package, attribute, module, raising=False)
+    monkeypatch.setitem(sys.modules, qualified_name, module)
+
+
 class _Variable:
     def __init__(self, value=None):
         self.value = value
@@ -42,6 +51,7 @@ class _Widget:
         self.afters = []
         self.destroyed = False
         self.text = ""
+        self.revision = 0
         self.__class__.all.append(self)
 
     def pack(self, *_args, **_kwargs):
@@ -89,6 +99,7 @@ class _Widget:
                 self.text = str(_where) + self.text
             else:
                 self.text += str(_where)
+            self.revision += 1
             return
         if iid is not None:
             self.items[iid] = values
@@ -96,6 +107,7 @@ class _Widget:
     def delete(self, item, _end=None):
         if self.options.get("wrap") == "word":
             self.text = ""
+            self.revision += 1
             return
         self.items.pop(item, None)
         if item in self.selected:
@@ -117,6 +129,48 @@ class _Widget:
 
     def get(self, *_args):
         return self.text if self.options.get("wrap") == "word" else ""
+
+    def replace(self, _start, _end, value):
+        self.text = str(value)
+        self.revision += 1
+
+    def invoke(self):
+        if self.options.get("state") != "disabled":
+            return self.options["command"]()
+
+
+class _FakeDraft:
+    """Tk-independent revision tracker preserving edits that return to old text."""
+
+    def __init__(self, widget):
+        self.widget = widget
+        self.closed = False
+        widget._instruction_draft_tracker = self
+
+    def snapshot(self):
+        if self.closed:
+            raise RuntimeError("instruction_draft_closed")
+        return {"revision": self.widget.revision,
+                "text": self.widget.get("1.0", "end-1c")}
+
+    def unchanged(self, ticket):
+        return not self.closed and type(ticket) is dict and ticket == self.snapshot()
+
+    def complete(self, ticket):
+        if not self.unchanged(ticket) or not ticket["text"].strip():
+            return False
+        self.widget.replace("1.0", "end-1c", "")
+        return self.widget.get("1.0", "end-1c") == ""
+
+    def adopt(self, text):
+        if self.closed:
+            raise RuntimeError("instruction_draft_closed")
+        if self.widget.get("1.0", "end-1c") != text:
+            self.widget.replace("1.0", "end-1c", text)
+        return self.snapshot()
+
+    def close(self):
+        self.closed = True
 
     def invoke(self):
         if self.options.get("state") != "disabled":
@@ -211,6 +265,8 @@ def desktop(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "PYTHON", "python-test")
 
     from agent_service import task_history, mailbox_panel, budget
+    from agent_service import instruction_draft
+    monkeypatch.setattr(instruction_draft, "InstructionDraft", _FakeDraft)
 
     callback_box = {"value": None}
 
@@ -228,8 +284,30 @@ def desktop(monkeypatch, tmp_path):
 
         def __init__(self, tab):
             self.tab = tab
+            self.status = _Variable()
+            self.closed = False
+            self.text = _Widget(wrap="word")
+            self.instruction_draft = _FakeDraft(self.text)
+            import threading
+            self.stopped = threading.Event()
+            self.preview_box = None
+            self.execute_button = _Widget()
+            self.external_activity_calls = 0
+            self.capability_sources = {"verified": "fixture-source"}
+
+        def notify_external_activity(self, _active_now, force=False):
+            self.external_activity_calls += 1
+            self.capability_sources.clear()
+
+        def set_busy(self, value):
+            self.running = value
+            if callable(getattr(self, "on_busy", None)):
+                self.on_busy(value)
 
         def stop(self):
+            pass
+
+        def execute(self):
             pass
 
         def close(self):
@@ -238,10 +316,23 @@ def desktop(monkeypatch, tmp_path):
         def use_generated_artifacts(self, _records):
             pass
 
+        def show_plan(self, plan, **_kwargs):
+            self.plan = plan
+
     monkeypatch.setattr(computer_panel, "attach_computer_tab",
                         lambda tab, *_args, **_kwargs: Panel(tab))
-    monkeypatch.setattr(computer_goal_panel, "attach_goal_tab",
+    from agent_service import windows_panel
+    monkeypatch.setattr(windows_panel, "attach_windows_tab",
                         lambda tab, *_args, **_kwargs: Panel(tab))
+    goal_panel_box = {}
+
+    def attach_goal(tab, *_args, **kwargs):
+        panel = Panel(tab)
+        panel.on_busy = kwargs.get("on_busy")
+        goal_panel_box["panel"] = panel
+        return panel
+
+    monkeypatch.setattr(computer_goal_panel, "attach_goal_tab", attach_goal)
     state = {"eligible": True, "reason": "ready", "continuation": None,
              "original_state": "cancelled",
              "preview_kind": None,
@@ -275,7 +366,7 @@ def desktop(monkeypatch, tmp_path):
         return {**state["outcome"], "attempt_id": attempt_id}
 
     resume_module.read_resume_result = read_result
-    monkeypatch.setitem(sys.modules, "agent_service.office_resume", resume_module)
+    _replace_package_module(monkeypatch, "agent_service.office_resume", resume_module)
     skill_resume_module = ModuleType("agent_service.skill_resume")
 
     def read_skill_result(_root, attempt_root, _base):
@@ -283,8 +374,9 @@ def desktop(monkeypatch, tmp_path):
                 "attempt_id": Path(attempt_root).name.removeprefix("skill-resume-")}
 
     skill_resume_module.read_resume_result = read_skill_result
-    monkeypatch.setitem(sys.modules, "agent_service.skill_resume", skill_resume_module)
+    _replace_package_module(monkeypatch, "agent_service.skill_resume", skill_resume_module)
     launcher.main([])
+    state["goal_panel"] = goal_panel_box["panel"]
     state["on_export"] = callback_box["value"]
     root = _Widget.all[0]
     _Thread.run("jarvis-history-list")
@@ -300,6 +392,8 @@ def desktop(monkeypatch, tmp_path):
 
 def test_resume_runs_only_dedicated_cli_and_reconciles_durable_outcome(desktop):
     root, task_root, state, _tree, original = desktop
+    main_text = next(w for w in _Widget.all if w.options.get("height") == 6)
+    main_text.insert("1.0", "仍在主任务页的草稿")
     button = _button("继续剩余办公步骤")
     assert button.cget("state") == "normal"
     button.invoke()
@@ -317,6 +411,7 @@ def test_resume_runs_only_dedicated_cli_and_reconciles_durable_outcome(desktop):
     _Thread.run("jarvis-resume-reconcile")
     _pump(root)
     assert (task_root / "result.json").read_bytes() == original
+    assert main_text.get("1.0", "end-1c") == "仍在主任务页的草稿"
     assert "本次续跑已完成" in next(w.options["textvariable"].get() for w in _Widget.all
                            if w.options.get("textvariable") and "本次续跑已完成" in str(w.options["textvariable"].get()))
     assert button.cget("state") == "disabled"
@@ -418,7 +513,7 @@ def test_verified_unsupported_history_shows_recorded_candidate_and_prepares_new_
                    "status": "available", "newly_available": True}]}
     gap_module.preview_retry = lambda *_args: dict(preview)
     gap_module.prepare_retry = lambda *_args: dict(preview)
-    monkeypatch.setitem(sys.modules, "agent_service.gap_recovery", gap_module)
+    _replace_package_module(monkeypatch, "agent_service.gap_recovery", gap_module)
 
     monkeypatch.setattr(task_history, "inspect_task", lambda *_args: {
         "root": str(task_root), "kind": "unsupported", "state": "unsupported",
@@ -481,7 +576,7 @@ def _gap_desktop(desktop, monkeypatch, *, eligible=True, source_kind="table",
 
     module.preview_retry = read
     module.prepare_retry = prepare
-    monkeypatch.setitem(sys.modules, "agent_service.gap_recovery", module)
+    _replace_package_module(monkeypatch, "agent_service.gap_recovery", module)
     tree.select(task_root.name)
     _Thread.run("jarvis-history-inspect")
     _pump(root)
@@ -773,7 +868,7 @@ def test_poll_rearms_after_callback_exception_without_hiding_it(desktop, monkeyp
         "eligible": False, "reason": "gap_source_changed", "task_root": str(old_root),
         "candidates": [{"id": BadId("first"), "name": "one", "status": "available"},
                        {"id": BadId("second"), "name": "two", "status": "available"}]}
-    monkeypatch.setitem(sys.modules, "agent_service.gap_recovery", module)
+    _replace_package_module(monkeypatch, "agent_service.gap_recovery", module)
     tree.select(old_root.name)
     _Thread.run("jarvis-history-inspect")
     _pump(root)
@@ -1110,6 +1205,14 @@ def test_history_output_requires_explicit_selection_and_paid_start(desktop, monk
         return dict(ref)
 
     monkeypatch.setattr(artifact_source, "prepare_artifact_source", prepare)
+    from agent_service import daily_task_routing, office_handoff
+    monkeypatch.setattr(office_handoff, "prepare_artifact_source", prepare)
+    routed = []
+    monkeypatch.setattr(daily_task_routing, "propose", lambda _session, instruction, refs, **_kwargs:
+                        routed.append((instruction, refs)) or {"state": "needs_input",
+                                                               "reason": "需要确认任务要求"})
+    entry = _button("按任务规划（云端）").options["command"].__self__
+    entry.session_factory = lambda: object()
     history_use = [w for w in _Widget.all if w.options.get("text") == "用于下一任务"][0]
     assert history_use.cget("state") == "normal"
     history_use.invoke()
@@ -1122,15 +1225,11 @@ def test_history_output_requires_explicit_selection_and_paid_start(desktop, monk
     task_text.get = lambda *_args: "请根据此文档生成下一份报告"
     _button("开始任务").invoke()
     assert _Process.created == []
-    _Thread.run("jarvis-artifact-source-start")
-    _pump(root)
+    _Thread.run("office-task-planning")
+    entry.poll()
     assert len(calls) == 2
     assert _Process.created == []
-    _Thread.run("jarvis-agent")
-    command = _Process.created[0].command
-    assert "--source-artifact-json" in command
-    assert "--source-file" not in command
-    assert json.loads(command[-1]) == ref
+    assert routed == [("请根据此文档生成下一份报告", [ref])]
     assert (original_root / "result.json").read_bytes() == original
 
 
@@ -1143,11 +1242,14 @@ def test_changed_history_output_blocks_before_model_and_clear_removes_ref(deskto
 
     def prepare(_path, _sha, _base):
         count["value"] += 1
-        if count["value"] == 2:
+        if count["value"] >= 2:
             raise artifact_source.ArtifactSourceError("artifact_source_receipt_mismatch")
         return dict(ref)
 
     monkeypatch.setattr(artifact_source, "prepare_artifact_source", prepare)
+    from agent_service import office_handoff
+    monkeypatch.setattr(office_handoff, "prepare_artifact_source", prepare)
+    entry = _button("按任务规划（云端）").options["command"].__self__
     history_use = [w for w in _Widget.all if w.options.get("text") == "用于下一任务"][0]
     history_use.invoke()
     _Thread.run("jarvis-artifact-source-select")
@@ -1155,15 +1257,17 @@ def test_changed_history_output_blocks_before_model_and_clear_removes_ref(deskto
     task_text = next(w for w in _Widget.all if w.options.get("height") == 6)
     task_text.get = lambda *_args: "根据这个文件继续"
     _button("开始任务").invoke()
-    _Thread.run("jarvis-artifact-source-start")
-    _pump(root)
+    _Thread.run("office-task-planning")
+    entry.poll()
     assert _Process.created == []
     assert len(list(original_root.parent.glob("task-*"))) == 1
-    assert any("开始前已变化" in str(w.options["textvariable"].get())
+    assert any("来源核验" in str(w.options["textvariable"].get())
                for w in _Widget.all if w.options.get("textvariable"))
     source_entry = next(w for w in _Widget.all if w.options.get("width") == 38)
     assert source_entry.options["textvariable"].get() == str(artifact)
     _button("开始任务").invoke()
+    _Thread.run("office-task-planning")
+    entry.poll()
     assert _Process.created == []
     assert len(list(original_root.parent.glob("task-*"))) == 1
     _button("清除").invoke()
@@ -1634,6 +1738,8 @@ def test_local_skill_rejects_version_switch_between_prepare_and_start(
 
 def test_local_skill_durable_office_result_uses_existing_output_and_history(desktop, monkeypatch, tmp_path):
     root, original_root, _state, _tree, original = desktop
+    main_text = next(w for w in _Widget.all if w.options.get("height") == 6)
+    main_text.insert("1.0", "主任务页的另一条指令")
     from agent_service import local_skills, artifact_source
     _mock_published_skill_version(monkeypatch)
     gate = {"remaining": 2, "calls": 0}
@@ -1694,6 +1800,7 @@ def test_local_skill_durable_office_result_uses_existing_output_and_history(desk
     assert any("剩余 1 次受限运行" in str(w.options["textvariable"].get())
                for w in _Widget.all if w.options.get("textvariable"))
     assert (original_root / "result.json").read_bytes() == original
+    assert main_text.get("1.0", "end-1c") == "主任务页的另一条指令"
 
 
 @pytest.mark.parametrize("end_state", ["failed", "unknown"])

@@ -122,7 +122,7 @@ def validate_spec(spec) -> dict:
             raise ValueError("invalid_document_fields")
         title = _string(spec["title"], 200, "title", nonempty=True)
         paragraphs = spec["paragraphs"]
-        if not isinstance(paragraphs, list) or len(paragraphs) > 40:
+        if not isinstance(paragraphs, list) or len(paragraphs) > 320:
             raise ValueError("invalid_paragraphs")
         paragraphs = [_string(p, 3000, "paragraph") for p in paragraphs]
         if len(title) + sum(map(len, paragraphs)) > 60000:

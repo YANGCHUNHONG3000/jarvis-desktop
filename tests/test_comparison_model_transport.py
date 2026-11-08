@@ -165,7 +165,8 @@ def test_transport_calls_once_maps_every_id_and_preserves_canonical_data(reviewi
         return response
     assert call_model(context, callback) == (review if reviewing else selected)
     assert len(calls) == 1 and context == before and response == response_before
-    assert MAX_INPUT_CHARS == 48000 and MAX_OUTPUT_TOKENS == REVIEW_MAX_TOKENS == MAX_OUTPUT == 2048
+    assert MAX_INPUT_CHARS == 48000 and MAX_OUTPUT_TOKENS == REVIEW_MAX_TOKENS == 2048
+    assert MAX_OUTPUT == 8192 and MAX_OUTPUT_TOKENS <= MAX_OUTPUT
 
 
 @pytest.mark.parametrize('case', ['unknown', 'canonical', 'duplicate', 'missing_source',

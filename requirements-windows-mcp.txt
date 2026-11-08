@@ -1,0 +1,4 @@
+# Isolated runtime: Python 3.14.6; upstream MIT; no local patch
+windows-mcp @ git+https://github.com/CursorTouch/Windows-MCP.git@b69ec872623b403f647fb3777685d4cf2678d3a2
+fastmcp==4.1.6
+mcp==2.3.0

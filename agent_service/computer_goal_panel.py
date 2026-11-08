@@ -6,6 +6,13 @@ from pathlib import Path
 from .computer import ComputerError, ComputerSession
 from .computer_goals import execute_goal, input_epoch, prepare_goal, propose_goal
 
+
+class _InstructionResult(dict):
+    """Carry local draft identity alongside a worker result, never into records."""
+    def __init__(self, value, ticket):
+        super().__init__(value)
+        self.ticket = ticket
+
 MODES = ('计算并记到新页', '把所选文字记到新页', '新建文字页', '选择资源管理器项目',
          '网页 → Excel → Word', '主题检索 → Excel → Word', '观察决策循环（浏览器与办公）',
          '网页点击输入／编辑已有 Word、Excel', '已读 GitHub → Word → 下一任务',
@@ -74,7 +81,9 @@ class GoalPanel:
         from tkinter import ttk
         self.tab, self.root, self.external_busy, self.on_busy = tab, root, busy, on_busy
         self.session = self.plan = None
+        self.plan_instruction_binding = None
         self.on_artifacts = lambda records: None
+        self.on_instruction_complete = lambda ticket: None
         self.interaction_request, self.interaction_fields = None, None
         self.comparison_goal, self.comparison_fields = None, None
         self.comparison_source = None
@@ -170,6 +179,8 @@ class GoalPanel:
         self.text_label = ttk.Label(tab, text='新页文字（可留空使用默认文本）；云端规划时填写完整任务描述')
         self.text_label.pack(anchor='w')
         self.text = tk.Text(tab, height=3, wrap='word')
+        from .instruction_draft import InstructionDraft
+        self.instruction_draft = InstructionDraft(self.text)
         self.text.pack(fill='x')
         self.text.bind('<<Modified>>', self.modified)
         row = ttk.Frame(tab)
@@ -190,11 +201,16 @@ class GoalPanel:
         self.human_continue_button = ttk.Button(row, text='已完成登录／验证，继续任务',
                                                command=self.continue_human, state='disabled')
         self.human_continue_button.pack(side='left')
-        self.status = tk.StringVar(value='先选择并读取窗口。本地执行不调用模型；云端沿用每日及滚动 24 小时各 ¥5 上限。')
+        self.status = tk.StringVar(value='先选择并读取窗口。本地执行不调用模型；云端沿用当前本地费用设置与共享账本。')
         ttk.Label(tab, textvariable=self.status, wraplength=710).pack(anchor='w')
+        from .office_intent_recovery_panel import OfficeIntentRecovery
+        self.intent_recovery = OfficeIntentRecovery(self)
+        self.intent_clarification_button = ttk.Button(tab, text='补充／找回编辑要求…',
+                                                     command=self.intent_recovery.open_answer)
+        self.intent_clarification_button.pack(anchor='w', before=self.preview_box)
         self.poll_id = root.after(100, self.poll)
 
-    def mode_changed(self, _=None):
+    def mode_changed(self, _=None, *, refresh_sources=True):
         self.daily_task_route_generation += 1
         self.capability_source_generation += 1
         self.capability_sources_validated_generation = None
@@ -208,7 +224,7 @@ class GoalPanel:
         interactive = self.mode.get() == MODES[7]
         office_intent = self.mode.get() == MODES[9]
         comparison = self.mode.get() == MODES[10]
-        self.pause_checkbox.configure(state='disabled' if self.mode.get() == MODES[11] else 'normal')
+        self._update_pause_checkbox()
         for widget in (self.comparison_source_button, self.comparison_reset_button):
             widget.configure(state='normal' if comparison and not self.running else 'disabled')
         self.capability_clarification_button.configure(
@@ -260,7 +276,100 @@ class GoalPanel:
             self.text_label.configure(text='完整任务说明（自动核对已有技能；只生成新文件）')
             self.control_label.configure(text='上一任务成果（默认按任务选择一份输入；多文件联合修改使用自然语言编辑模式）')
             self.propose_button.configure(state='disabled')
-            self.refresh_capability_sources()
+            if refresh_sources:
+                self.refresh_capability_sources()
+
+    def use_task_route(self, session, instruction, routed, refs, is_current):
+        """Accept one persisted route without replanning or refreshing its sources."""
+        from copy import deepcopy
+        from .computer import digest, read_record, safe_root
+        from . import daily_task_routing
+
+        def current():
+            try:
+                return callable(is_current) and bool(is_current())
+            except Exception:
+                return False
+
+        if self.running or self.external_busy() or self.closed or not current():
+            return False
+        try:
+            if (not isinstance(session, ComputerSession) or type(instruction) is not str
+                    or instruction != instruction.strip() or not 1 <= len(instruction) <= 4000
+                    or type(refs) is not list or len(refs) > 4
+                    or type(routed) is not dict or routed.get('state') not in {'ready', 'needs_scope'}
+                    or type(routed.get('routing')) is not str):
+                raise ValueError('task_route_handoff_invalid')
+            # The router already verified these exact references. Rebuild its
+            # durable view to reject replaced plans, selections or instructions.
+            route = safe_root(routed['routing'])
+            routes = safe_root(session.root / 'task_routes')
+            if route.parent != routes:
+                raise ValueError('task_route_handoff_invalid')
+            request = read_record(route / 'request.json')
+            if (type(request) is not dict or type(request.get('schema')) is not int
+                    or request['schema'] != daily_task_routing.POLICY
+                    or request.get('instruction') != instruction or request.get('source_refs') != refs
+                    or route.name != digest(request)
+                    or daily_task_routing._cached(session, route, request) != routed):
+                raise ValueError('task_route_handoff_changed')
+            records = []
+            for ref in refs:
+                if (type(ref) is not dict or type(ref.get('artifact')) is not str
+                        or not Path(ref['artifact']).is_absolute()
+                        or Path(ref['artifact']).suffix.lower() not in {'.docx', '.xlsx'}
+                        or type(ref.get('sha256')) is not str
+                        or len(ref['sha256']) != 64
+                        or any(c not in '0123456789abcdef' for c in ref['sha256'])):
+                    raise ValueError('task_route_handoff_sources_invalid')
+                records.append({'path': ref['artifact'], 'sha256': ref['sha256']})
+            if len({record['path'] for record in records}) != len(records):
+                raise ValueError('task_route_handoff_sources_invalid')
+            if routed['state'] == 'ready':
+                if type(routed.get('plan')) is not dict or routed['plan'].get('mode') not in {'capability', 'office_bundle'}:
+                    raise ValueError('task_route_handoff_plan_invalid')
+            else:
+                edit = routed.get('edit')
+                if (routed.get('plan') is not None or type(edit) is not dict
+                        or set(edit) != {'instruction', 'source_refs'}
+                        or edit['instruction'] != instruction or len(instruction) > 1000
+                        or type(edit['source_refs']) is not list or not edit['source_refs']
+                        or any(ref not in refs for ref in edit['source_refs'])):
+                    raise ValueError('task_route_handoff_edit_invalid')
+                records = [{'path': ref['artifact'], 'sha256': ref['sha256']}
+                           for ref in edit['source_refs']]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            self.status.set('任务规划记录或来源绑定无效，未接入；请重新核验。')
+            return False
+        draft = self.text.get('1.0', 'end-1c')
+        if draft and draft.strip() != instruction:
+            self.status.set('连续任务页已有不同的任务草稿，请先自行处理；原草稿已保留。')
+            return False
+        if not current() or self.running or self.external_busy() or self.closed:
+            return False
+        self.invalidate()
+        self.session = session
+        if not draft:
+            self.instruction_draft.adopt(instruction)
+        self.text.edit_modified(False)
+        if routed['state'] == 'needs_scope':
+            self.use_generated_artifacts(deepcopy(records))
+            return True
+        self.capability_history_seed = {
+            'task_id': '本次任务规划', 'records': deepcopy(records), 'is_current': is_current}
+        self.mode.set(MODES[11])
+        self.mode_changed(refresh_sources=False)
+        self.capability_sources = deepcopy(refs)
+        self.capability_sources_validated_generation = self.capability_source_generation
+        self.capability_preview_generation = self.capability_source_generation
+        self.control.configure(state='readonly', values=['自动按任务选择输入', '无来源文件'] +
+                               [f"{n}. {ref['artifact']}" for n, ref in enumerate(refs, 1)])
+        self.control.current(0 if refs else 1)
+        self.capability_source_label.set('来源：本次任务规划（固定已核验批次）')
+        self.update_office_bundle_button()
+        self.show_plan(deepcopy(routed['plan']), instruction_ticket=self.draft_ticket())
+        self.status.set('任务规划已接入；请核对完整指令和来源，再批准。')
+        return True
 
     def refresh_capability_sources(self):
         if self.running or self.external_busy():
@@ -292,8 +401,8 @@ class GoalPanel:
             return False
         from copy import deepcopy
         records = deepcopy(records)
-        if not isinstance(task_id, str) or not 2 <= len(records) <= 4:
-            self.status.set('历史批次必须包含同一任务的 2 至 4 份 Word/Excel 成果。')
+        if not isinstance(task_id, str) or not 1 <= len(records) <= 4:
+            self.status.set('历史能力来源必须包含同一任务的 1 至 4 份 Word/Excel 成果。')
             return False
         if any(type(item) is not dict or not isinstance(item.get('path'), str)
                or Path(item['path']).suffix.lower() not in {'.docx', '.xlsx'}
@@ -308,7 +417,7 @@ class GoalPanel:
         self.invalidate()
         self.mode.set(MODES[11])
         self.mode_changed()
-        self.status.set(f'正在重新核验历史任务 {task_id} 的整批来源；未调用模型或启动 Office。')
+        self.status.set(f'正在重新核验历史任务 {task_id} 的能力来源；未调用模型或启动 Office。')
         return True
 
     def use_previous_task_artifacts(self):
@@ -381,7 +490,7 @@ class GoalPanel:
             result = propose(session, instruction, source_refs, stop=self.stopped.is_set)
             return {'token': token, 'result': result}
 
-        self.start('daily_task_route', work)
+        self.start_instruction('daily_task_route', work, self.draft_ticket())
 
     def _history_seed_is_current(self):
         seed = self.capability_history_seed
@@ -448,7 +557,7 @@ class GoalPanel:
         refs = deepcopy(self.capability_sources)
         self.capability_preview_generation = self.capability_source_generation
         self.invalidate()
-        self.start('office_bundle_preview', lambda s: prepare(s, instruction, refs))
+        self.start_instruction('office_bundle_preview', lambda s: prepare(s, instruction, refs), self.draft_ticket())
 
     def preview_capability(self, instruction):
         if not self._history_source_is_validated():
@@ -466,7 +575,7 @@ class GoalPanel:
                    {'source_ref': deepcopy(self.capability_sources[index - 2]) if index > 1 else None})
         self.capability_preview_generation = self.capability_source_generation
         self.invalidate()
-        self.start('capability_preview', lambda s: prepare(s, instruction, **options))
+        self.start_instruction('capability_preview', lambda s: prepare(s, instruction, **options), self.draft_ticket())
 
     def configure_comparison(self):
         if self.running or self.external_busy():
@@ -555,17 +664,61 @@ class GoalPanel:
         self.mode.set(MODES[9])
         self.mode_changed()
         try:
-            open_file_selector(self.root, records, self.prepare_generated_scope)
+            if 1 <= len(records) <= 4:
+                self.prepare_generated_scope(records)
+            else:
+                open_file_selector(self.root, records, self.prepare_generated_scope)
         except ValueError as exc:
             self.status.set(str(exc))
 
+    def _generated_scope_context(self):
+        from copy import deepcopy
+        tracker = getattr(self, 'instruction_draft', None)
+        return deepcopy({'mode': self.mode.get(), 'files': self.office_planning_files,
+                         'refs': self.office_artifact_refs, 'scope': self.office_scope,
+                         'plan': self.plan, 'draft': tracker.snapshot() if tracker is not None
+                         else self.text.get('1.0', 'end-1c')})
+
     def prepare_generated_scope(self, records):
+        from copy import deepcopy
         from .office_handoff import select_outputs
         from .office_scope import inspect_files
+        if self.running or self.closed or self.external_busy():
+            return
+        context = self._generated_scope_context()
+        records = deepcopy(records)
+        generation = getattr(self, '_generated_scope_generation', 0) + 1
+        self._generated_scope_generation = generation
+        self._generated_scope_pending = generation
         def work(session):
             refs = select_outputs(records)
-            return inspect_files(session, [r['artifact'] for r in refs], artifact_refs=refs, stop=self.stopped.is_set)
-        self.start('office_scope', work)
+            catalog = inspect_files(session, [r['artifact'] for r in refs], artifact_refs=refs, stop=self.stopped.is_set)
+            return {'catalog': catalog, 'context': context, 'generation': generation,
+                    'session_root': str(session.root)}
+        self.start('generated_scope', work)
+
+    def accept_generated_scope(self, result, selection=None):
+        from .office_scope import selection_from_indices
+        if (self.running or self.closed or self.stopped.is_set() or self.external_busy()
+                or getattr(self, '_generated_scope_pending', None) != result['generation']
+                or self._generated_scope_context() != result['context']
+                or self.session is None or str(self.session.root) != result['session_root']):
+            self.status.set('任务、来源或草稿已变化；迟到成果未接入，当前输入保留。')
+            return
+        if selection is None:
+            catalog = result['catalog']
+            indices = [(i,j) for i,file in enumerate(catalog['files']) for j,_ in enumerate(file['entries'])]
+            try:
+                selection = selection_from_indices(catalog, indices)
+            except ComputerError as exc:
+                from .office_scope_panel import open_scope_selector
+                self.status.set('无法自动选入全部范围：'+str(exc)+'；请缩小范围，尚未调用模型。')
+                open_scope_selector(self.root, catalog, lambda chosen: self.accept_generated_scope(result, chosen))
+                return
+        self._generated_scope_pending = None
+        self.accept_scope(selection)
+        self.status.set(f'已接入 {len(self.office_planning_files)} 份成果，可直接描述多处修改；'
+                        '云端规划后核对差异再执行。可点“选择编辑范围”缩小范围，尚未调用模型。')
 
     def configure_scope(self):
         if self.running or self.external_busy():
@@ -604,7 +757,9 @@ class GoalPanel:
 
     def invalidate(self, clear_snapshots=False):
         self.plan = None
+        self.plan_instruction_binding = None
         self.execute_button.configure(state='disabled')
+        self._update_pause_checkbox()
         self.show_text('尚无有效目标预览。')
         if clear_snapshots:
             self.snapshots, self.controls = {}, []
@@ -622,12 +777,59 @@ class GoalPanel:
             self.invalidate()
             self.text.edit_modified(False)
 
+    def draft_ticket(self):
+        tracker = getattr(self, 'instruction_draft', None)
+        ticket = tracker.snapshot() if tracker is not None else None
+        return ticket if ticket is not None and ticket['text'].strip() else None
+
+    def instruction_ticket(self, plan):
+        """Only a plan explicitly prepared for this unchanged draft may consume it."""
+        from .computer import digest
+        binding = getattr(self, 'plan_instruction_binding', None)
+        tracker = getattr(self, 'instruction_draft', None)
+        if (binding is None or tracker is None or plan is None or 'recovery' in plan
+                or binding['plan_sha256'] != digest(plan)
+                or not tracker.unchanged(binding['ticket'])):
+            return None
+        return dict(binding['ticket'])
+
+    def start_instruction(self, kind, operation, ticket):
+        if ticket is None:
+            self.start(kind, operation)
+        else:
+            self.start(kind, lambda session: _InstructionResult(operation(session), ticket))
+
+    def complete_instruction(self, ticket, kind, result):
+        tracker = getattr(self, 'instruction_draft', None)
+        if (ticket is None or tracker is None or self.closed or self.stopped.is_set()
+                or kind not in {'execute', 'capability_execute', 'office_bundle_execute', 'repository_document'}
+                or type(result) is not dict or result.get('ok') is not True):
+            return
+        terminal = (
+            kind == 'execute' and result.get('state') == 'verified'
+            and result.get('code') in {'approved_plan_verified', 'objective_verified'}
+            or kind == 'capability_execute' and result.get('state') == 'succeeded'
+            and result.get('code') == 'capability_verified'
+            or kind == 'office_bundle_execute' and result.get('state') == 'succeeded'
+            or kind == 'repository_document' and result.get('state') == 'verified'
+            and result.get('code') == 'repository_document_verified')
+        if not terminal:
+            return
+        if tracker.complete(ticket):
+            self.text.edit_modified(False)
+        try:
+            self.on_instruction_complete(dict(ticket))
+        except Exception:
+            # The verified task remains complete if another UI cannot accept
+            # its local draft notification.
+            pass
+
     def set_busy(self, value):
         self.running = value
         if not value:
             self.cancel_human()
         self.on_busy(value)
-        self.pause_checkbox.configure(state='disabled' if value or self.mode.get() == MODES[11] else 'normal')
+        self._update_pause_checkbox()
         self.output_edit_button.configure(state='disabled' if value else 'normal')
         self.scope_button.configure(state='disabled' if value else 'normal')
         self.recovery_button.configure(state='disabled' if value else 'normal')
@@ -669,7 +871,10 @@ class GoalPanel:
                 if self.session is None:
                     self.session = ComputerSession.create(host=self.host)
                 result = operation(self.session)
-                self.messages.put((kind, result, None))
+                if isinstance(result, _InstructionResult):
+                    self.messages.put((kind, dict(result), None, result.ticket))
+                else:
+                    self.messages.put((kind, result, None))
             except Exception as exc:
                 self.messages.put((kind, None, str(exc) if isinstance(exc, ComputerError) else 'operation_failed'))
         try:
@@ -740,12 +945,12 @@ class GoalPanel:
                     goal, selection = deepcopy(self.comparison_goal), deepcopy(self.comparison_source)
                     instruction = text.strip() or goal['title']
                     self.invalidate()
-                    self.start('comparison_preview', lambda s: prepare_selected(
+                    self.start_instruction('comparison_preview', lambda s: prepare_selected(
                         s, instruction, goal, selection, stop=self.stopped.is_set,
-                        progress=lambda message: self.messages.put(('comparison_progress', message, None))))
+                        progress=lambda message: self.messages.put(('comparison_progress', message, None))), self.draft_ticket())
                     return
                 self.show_plan(prepare(self.session, text.strip() or self.comparison_goal['title'],
-                                       self.comparison_goal))
+                                       self.comparison_goal), instruction_ticket=self.draft_ticket())
                 self.status.set('请核对来源数、网站数和维度；批准后读取真实结果并选取原文，保存 Excel 和 Word。')
                 return
             if mode == MODES[9]:
@@ -768,7 +973,8 @@ class GoalPanel:
                     raise ComputerError('请先设置网页与文件编辑范围')
                 if self.session is None:
                     self.session = ComputerSession.create(host=self.host)
-                self.show_plan(prepare(self.session, text.strip() or '完成所选网页查询与文件编辑', **self.interaction_request))
+                self.show_plan(prepare(self.session, text.strip() or '完成所选网页查询与文件编辑', **self.interaction_request),
+                               instruction_ticket=self.draft_ticket())
                 self.status.set('请核对网页输入及文件逐处修改；批准后进入同一个观察决策循环。')
                 return
             elif mode == MODES[6]:
@@ -777,7 +983,7 @@ class GoalPanel:
                     self.session = ComputerSession.create(host=self.host)
                 self.show_plan(prepare(self.session, text.strip(), {'queries':[text.strip()],
                     'title':expression.strip() or text.strip()[:200], 'min_sources':1,
-                    'required_terms':[], 'outputs':['spreadsheet','document']}))
+                    'required_terms':[], 'outputs':['spreadsheet','document']}), instruction_ticket=self.draft_ticket())
                 self.status.set('请核对目标条件与动态操作范围；批准后开始观察决策循环。')
                 return
             elif mode == MODES[5]:
@@ -815,10 +1021,44 @@ class GoalPanel:
             self.invalidate()
             self.status.set('未生成目标：' + str(exc))
 
-    def show_plan(self, plan):
+    def show_plan(self, plan, *, instruction_ticket=None, planning_result=None):
+        from .computer import digest
+        validator = getattr(self, 'before_show_plan', None)
+        if callable(validator):
+            try:
+                accepted = validator(self.session, plan, instruction_ticket, planning_result)
+            except Exception:
+                accepted = False
+            if accepted is not True:
+                self.invalidate()
+                self.status.set('任务清单无法核验本次编辑预览；原要求和成果保留，未开放执行。')
+                return False
         self.plan = plan
+        self.plan_instruction_binding = None
+        tracker = getattr(self, 'instruction_draft', None)
+        if (plan is not None and 'recovery' not in plan and tracker is not None
+                and instruction_ticket is not None and tracker.unchanged(instruction_ticket)
+                and plan.get('instruction') == instruction_ticket['text'].strip()):
+            self.plan_instruction_binding = {'plan_sha256': digest(plan),
+                                             'ticket': dict(instruction_ticket)}
+        self._update_pause_checkbox()
         self.show_text(describe(plan) if plan else '当前目标不在已支持范围内。')
         self.execute_button.configure(state='normal' if plan else 'disabled')
+        return True
+
+    def _update_pause_checkbox(self):
+        """Offer bounded file-step pauses for mail or joint reports in capability mode."""
+        if self.running:
+            enabled = False
+        elif self.mode.get() == MODES[11]:
+            plan = self.plan or {}
+            enabled = ((plan.get('schema') == 4 and plan.get('mode') == 'capability'
+                        and plan.get('capability') == 'mail_understanding')
+                       or (plan.get('schema') == 1 and plan.get('mode') == 'office_bundle'))
+        else:
+            # Existing generic, agent, and adapter pause behavior is unchanged.
+            enabled = True
+        self.pause_checkbox.configure(state='normal' if enabled else 'disabled')
 
     def list_capability_clarifications(self):
         if (self.running or self.external_busy() or self.closed
@@ -936,6 +1176,9 @@ class GoalPanel:
             self.status.set('此模式请设置对比范围并本地预览；自然语言理解可使用“观察决策循环”模式。')
             return
         if self.mode.get() == MODES[9]:
+            recovery = getattr(self, 'intent_recovery', None)
+            if recovery is not None:
+                return recovery.propose()
             files = tuple(self.office_planning_files)
             instruction = self.text.get('1.0', 'end-1c').strip()
             if not files or not instruction:
@@ -946,8 +1189,17 @@ class GoalPanel:
             refs = deepcopy(self.office_artifact_refs)
             scope = deepcopy(self.office_scope)
             self.invalidate()
-            self.start('propose', lambda s: propose(s, instruction, files, stop=self.stopped.is_set,
-                                                   artifact_refs=refs,scope=scope))
+            self.stopped.clear()
+            provider = getattr(self, 'office_planning_context', None)
+            guard = deepcopy(provider()) if callable(provider) else None
+
+            def work(session):
+                result = propose(session, instruction, files, stop=self.stopped.is_set,
+                                 artifact_refs=refs, scope=scope)
+                # This UI-owned key must never be accepted from model output.
+                return {**result, '_office_guard': guard}
+
+            self.start_instruction('propose', work, self.draft_ticket())
             return
         if self.mode.get() in (MODES[7], MODES[8]):
             self.status.set('此模式按明确网页与文件修改范围本地预览；执行中多候选才调用原预算模型。')
@@ -956,13 +1208,13 @@ class GoalPanel:
             from .computer_agent import propose
             instruction = self.text.get('1.0', 'end-1c')
             self.invalidate()
-            self.start('propose', lambda s: propose(s, instruction, stop=self.stopped.is_set))
+            self.start_instruction('propose', lambda s: propose(s, instruction, stop=self.stopped.is_set), self.draft_ticket())
             return
         if self.mode.get() == MODES[5]:
             from .computer_goal_adapters import propose_research_goal
             instruction = self.text.get('1.0', 'end-1c')
             self.invalidate()
-            self.start('propose', lambda s: propose_research_goal(s, instruction, stop=self.stopped.is_set))
+            self.start_instruction('propose', lambda s: propose_research_goal(s, instruction, stop=self.stopped.is_set), self.draft_ticket())
             return
         if self.mode.get() == MODES[4]:
             self.status.set('网页办公任务使用本地预览即可，不需要调用云端模型。')
@@ -972,10 +1224,15 @@ class GoalPanel:
             self.status.set('请先读取所选窗口。')
             return
         self.invalidate()
-        self.start('propose', lambda s: propose_goal(s, instruction, snapshots, stop=self.stopped.is_set))
+        self.start_instruction('propose', lambda s: propose_goal(s, instruction, snapshots, stop=self.stopped.is_set), self.draft_ticket())
 
     def execute(self):
         if self.running or self.external_busy() or self.plan is None:
+            return
+        ticket = self.instruction_ticket(self.plan)
+        if getattr(self, 'plan_instruction_binding', None) is not None and ticket is None:
+            self.invalidate()
+            self.status.set('指令草稿已变化；请重新规划并核对差异后批准。')
             return
         if (self.plan.get('mode') in {'capability', 'office_bundle'}
                 and not self._history_source_is_validated()):
@@ -985,23 +1242,39 @@ class GoalPanel:
         if self.plan.get('mode') == 'capability':
             from .capability_router import execute
             plan = self.plan
+            pause_after_step = bool(
+                plan.get('schema') == 4
+                and plan.get('capability') == 'mail_understanding'
+                and self.pause_each_step.get())
             self.invalidate()
-            self.start('capability_execute', lambda s: execute(s, plan,
-                approval=plan['sha256'], stop=self.stopped.is_set))
+            def run_capability(s):
+                kwargs = {'approval': plan['sha256'], 'stop': self.stopped.is_set}
+                if pause_after_step:
+                    kwargs['pause_after_step'] = True
+                return execute(s, plan, **kwargs)
+            self.start_instruction('capability_execute', run_capability, ticket)
             return
         if self.plan.get('mode') == 'office_bundle':
             from .office_bundle import execute
             plan = self.plan
+            pause_after_step = bool(self.pause_each_step.get())
             self.invalidate()
-            self.start('office_bundle_execute', lambda s: execute(
-                s, plan, approval=plan['sha256'], stop=self.stopped.is_set))
+            def run_bundle(s):
+                kwargs = {'approval': plan['sha256'], 'stop': self.stopped.is_set}
+                if pause_after_step:
+                    from .office_workflow import run_office_workflow
+                    def paused_workflow(steps, root, **options):
+                        return run_office_workflow(steps, root, pause_after_step=True, **options)
+                    kwargs['workflow_runner'] = paused_workflow
+                return execute(s, plan, **kwargs)
+            self.start_instruction('office_bundle_execute', run_bundle, ticket)
             return
         if self.plan.get('mode') == 'repository_document':
             from .repository_document import execute_repository_document
             plan = self.plan
             self.invalidate()
-            self.start('repository_document', lambda s: execute_repository_document(
-                plan, approval=plan['sha256'], stop=self.stopped.is_set))
+            self.start_instruction('repository_document', lambda s: execute_repository_document(
+                plan, approval=plan['sha256'], stop=self.stopped.is_set), ticket)
             return
         try:
             epoch = None if self.plan.get('mode') in {'adapters','agent'} else input_epoch()
@@ -1027,11 +1300,13 @@ class GoalPanel:
                 except (ValueError,OSError):
                     self.open_edit_adapter()
                     return
+            from .office_edit_adapter_panel import capture_instruction
+            ticket = capture_instruction(self, self.session, plan, ticket)
             pause_requested = bool(self.pause_each_step.get())
             self.invalidate()
-            self.start('execute', lambda s: execute_edit_adapter(self,s,plan,
+            self.start_instruction('execute', lambda s: execute_edit_adapter(self,s,plan,
                 progress=lambda p: self.messages.put(('progress',p,None)),
-                pause_after_step=lambda:pause_requested))
+                pause_after_step=lambda:pause_requested), ticket)
             return
         if plan.get('mode') == 'agent':
             # Read Tk state on the UI thread; workers receive only a captured bool.
@@ -1040,9 +1315,9 @@ class GoalPanel:
             if plan.get('goal',{}).get('kind') == 'interactive':
                 agent_options['human_handoff'] = self.wait_for_human
         self.invalidate()
-        self.start('execute', lambda s: execute_goal(s, plan, approval=plan['sha256'], epoch=epoch,
+        self.start_instruction('execute', lambda s: execute_goal(s, plan, approval=plan['sha256'], epoch=epoch,
                    stop=self.stopped.is_set, progress=lambda p: self.messages.put(('progress', p, None)),
-                   agent_options=agent_options))
+                   agent_options=agent_options), ticket)
 
     def refresh_repository_readings(self):
         if self.running or self.external_busy():
@@ -1105,6 +1380,9 @@ class GoalPanel:
         if self.poll_id is not None:
             self.root.after_cancel(self.poll_id)
             self.poll_id = None
+        tracker = getattr(self, 'instruction_draft', None)
+        if tracker is not None:
+            tracker.close()
 
     def poll(self):
         if self.poll_id is not None:
@@ -1118,7 +1396,9 @@ class GoalPanel:
             self.notify_external_activity(False)
         try:
             while True:
-                kind, result, error = self.messages.get_nowait()
+                message = self.messages.get_nowait()
+                kind, result, error = message[:3]
+                instruction_ticket = message[3] if len(message) == 4 else None
                 if kind == 'human':
                     request, event, answer = result
                     if self.running and not self.stopped.is_set() and not event.is_set():
@@ -1160,6 +1440,31 @@ class GoalPanel:
                     self.status.set(f"正在执行 {result['step']}/{result['total']}：{NAMES[result['op']]}" + hint)
                     continue
                 self.set_busy(False)
+                recovery = getattr(self, 'intent_recovery', None)
+                if recovery is not None and recovery.handle(kind, result, error):
+                    continue
+                if kind == 'propose' and type(result) is dict and '_office_continuation' in result:
+                    if recovery is None or not recovery.accepts(result):
+                        self.invalidate()
+                        self.status.set('任务、来源或草稿已变化；迟到的澄清/规划未接入，记录仍保留。')
+                        continue
+                if kind == 'propose' and type(result) is dict and '_office_guard' in result:
+                    provider = getattr(self, 'office_planning_context', None)
+                    try:
+                        current = not callable(provider) or provider() == result['_office_guard']
+                    except Exception:
+                        current = False
+                    if not current:
+                        self.invalidate()
+                        self.status.set('任务、来源或范围已变化；迟到规划已丢弃，原草稿已保留。')
+                        continue
+                if (instruction_ticket is not None and kind in {'propose', 'capability_preview',
+                        'office_bundle_preview', 'daily_task_route', 'comparison_preview'}
+                        and not self.instruction_draft.unchanged(instruction_ticket)):
+                    self.invalidate()
+                    self.status.set('指令草稿已变化；迟到规划已丢弃，请重新规划。')
+                    continue
+                self.complete_instruction(instruction_ticket, kind, result)
                 if kind == 'edit_adapter_state' and result:
                     from .office_edit_adapter_panel import describe_state
                     self.show_text(describe_state(result))
@@ -1169,14 +1474,32 @@ class GoalPanel:
                     self.invalidate(True)
                     detail = describe_result(result)
                     self.show_text(detail + '\n记录：' + result['run'])
-                    self.status.set('产物已通过回读核验，请核对任务要求。' if result['ok'] else '任务未完成，原因与下一步见上方。')
+                    paused_after_step = result.get('code') == 'office_paused_after_verified_step'
+                    if paused_after_step:
+                        self.status.set('已在首个 Office 成果核验后按要求暂停。请到“历史任务”选择“继续剩余办公步骤”；已核验成果会保留，不会重做邮件理解。')
+                    elif result['ok'] and (self.stopped.is_set() or self.closed):
+                        self.status.set('产物已通过回读核验并保留；已停止或面板已关闭，未自动接力。')
+                    else:
+                        self.status.set('产物已通过回读核验，请核对任务要求。' if result['ok'] else '任务未完成，原因与下一步见上方。')
                     if result.get('code') == 'capability_source_ambiguous':
                         self.status.set('作用尚未开始；可点击“明确来源后继续…”选择一份输入并生成新的预览。旧记录保留。')
                         self.show_text(detail + '\n\n可点击“明确来源后继续…”选择已核验输入，生成新的批准预览。原尝试保留，未知执行不会列入继续列表。\n记录：' + result['run'])
-                    if result['ok'] and result.get('artifacts'):
+                    elif result.get('code') == 'mail_analysis_needs_input':
+                        prompt = '请补充完整任务说明，再点击“按任务规划（云端）”生成新预览。已核验来源和原任务记录保留；当前未执行办公步骤，也不会自动接力。'
+                        self.status.set(prompt)
+                        self.show_text(detail + '\n\n' + prompt
+                                       + '\n当前已核验来源仍保留：' + self.capability_source_label.get()
+                                       + '\n记录：' + result['run'])
+                    if (result['ok'] and result.get('artifacts')
+                            and not self.stopped.is_set() and not self.closed
+                            and not paused_after_step):
                         try:
                             self.on_artifacts(result['artifacts'])
-                            self.show_text(detail + '\nOffice 成果已自动接入下一任务。\n记录：' + result['run'])
+                            has_office = any(Path(item['path']).suffix.lower() in {'.docx', '.xlsx'}
+                                             for item in result['artifacts'])
+                            handoff_message = ('Office 成果已自动接入下一任务。' if has_office else
+                                               '本地草稿已显示在主界面成果列表；可打开预览，未发送。')
+                            self.show_text(detail + '\n' + handoff_message + '\n记录：' + result['run'])
                         except Exception:
                             self.show_text(detail + '\n成果已保存，但自动接力未完成。\n记录：' + result['run'])
                             self.status.set('成果已保存，自动接力未完成；可从历史任务重新选用。')
@@ -1235,6 +1558,8 @@ class GoalPanel:
                                   '请点击“本地预览目标”，再批准新任务，在新开的 Edge 窗口登录；旧任务不能继续。')
                     self.status.set(status + f"；已核验 {len(result['completed'])} 步。记录：{result['run']}")
                     if result.get('mode') == 'adapters':
+                        can_handoff = (result.get('ok') is True
+                                       and not self.stopped.is_set() and not self.closed)
                         lines = [status, *[f"{a['kind']}：{a['path']}" for a in result['artifacts']]]
                         if result.get('repository_read'):
                             repo = result['repository_read']
@@ -1243,14 +1568,17 @@ class GoalPanel:
                                       '本机读取的仓库正文摘录：', repo['text'][:12000]]
                         if result.get('repository_report'):
                             report = result['repository_report']
-                            lines.insert(1, 'Word 已生成并核验，将自动接到下一任务。' if report['ok'] else
+                            lines.insert(1, ('Word 已生成并核验，将自动接到下一任务。' if can_handoff else
+                                             'Word 已生成并核验，成果保留；当前未自动接力。') if report['ok'] else
                                          '仓库已读，Word 阶段未完成：'+report['code'])
                         self.show_text('\n'.join(lines))
-                        if result['artifacts']:
+                        if can_handoff and result['artifacts']:
                             try:
                                 self.on_artifacts(result['artifacts'])
                             except Exception:
                                 self.status.set(status + '；自动接力未完成，成果已保存，可从历史任务重新选用。')
+                        elif result['artifacts']:
+                            self.status.set(status + '；成果保留，未自动接力；可从历史任务核验。')
                     else:
                         self.show_text('\n'.join([status, '新建记事本页未保存到文件。', *[f"{k} = {v}" for k, v in result['outputs'].items()]]))
                     if not result['ok']:
@@ -1271,6 +1599,8 @@ class GoalPanel:
                         self.status.set('历史来源核验未通过：文件已变化、证据不完整或接力层级不支持。未重跑旧步骤；请另选来源。')
                     elif error and error.startswith('edit_adapter_'):
                         self.status.set('编辑适配器尚未通过当前阶段：'+error+'。请打开“编辑适配器…”查看测试、审查、试运行或限用状态；原文件未覆盖。')
+                    elif kind == 'propose' and recovery is not None:
+                        recovery.failure(error)
                     else:
                         self.status.set('未完成：' + (error or '已停止') + '。需要重新读取和预览。')
                 elif kind == 'capability_sources':
@@ -1296,7 +1626,7 @@ class GoalPanel:
                                           for item in self.capability_history_seed['records'])
                         self.capability_source_label.set(
                             f"来源：历史任务 {self.capability_history_seed['task_id']}（{names}）")
-                        self.status.set(f'历史批次已核验并整批保留：{names}。填写任务后先本地预览；预览仍需批准。')
+                        self.status.set(f'历史能力来源已核验并保留：{names}。填写任务后先本地预览；预览仍需批准。')
                     else:
                         self.capability_source_label.set('来源：上一任务成果')
                         self.status.set('已带入上一任务成果；填写完整任务，先本地预览。批准后选择输入，无法确定时会提示。')
@@ -1314,7 +1644,7 @@ class GoalPanel:
                         self.invalidate()
                         self.status.set('来源已变化；旧能力预览已丢弃，请重新核验并预览。')
                         continue
-                    self.show_plan(result)
+                    self.show_plan(result, instruction_ticket=instruction_ticket)
                     self.status.set('本地预览完成；批准后再调用模型匹配技能或现有适配器。')
                 elif kind == 'daily_task_route':
                     if type(result) is not dict or type(result.get('token')) is not dict:
@@ -1338,10 +1668,19 @@ class GoalPanel:
                         continue
                     state = routed.get('state')
                     if state == 'ready' and isinstance(routed.get('plan'), dict):
-                        self.show_plan(routed['plan'])
+                        self.show_plan(routed['plan'], instruction_ticket=instruction_ticket)
                         reason = routed.get('reason') or '已选择适用的现有能力。'
                         self.status.set('已选择：' + str(reason)
                                         + ' 请检查来源和完整计划后批准。')
+                    elif state == 'needs_scope':
+                        from copy import deepcopy
+                        index = token['control_index']
+                        refs = (self.capability_sources if index == 0 else [] if index == 1
+                                else self.capability_sources[index - 2:index - 1])
+                        self.use_task_route(
+                            self.session, token['instruction'], routed, deepcopy(refs),
+                            lambda: (not self.closed and not self.stopped.is_set()
+                                     and not self.external_busy() and self._history_seed_is_current()))
                     elif state in {'needs_input', 'blocked'}:
                         self.invalidate()
                         message = routed.get('reason') or ('需要补充任务信息。' if state == 'needs_input'
@@ -1358,7 +1697,7 @@ class GoalPanel:
                         self.invalidate()
                         self.status.set('来源已变化；旧联合核对预览已丢弃，请重新核验并预览。')
                         continue
-                    self.show_plan(result)
+                    self.show_plan(result, instruction_ticket=instruction_ticket)
                     self.status.set('联合核对预览完成；请检查全部来源与输出范围，再点击批准。')
                 elif kind == 'generated_artifacts':
                     self.use_generated_artifacts(result)
@@ -1380,7 +1719,7 @@ class GoalPanel:
                     self.show_text(source_description(result))
                     self.status.set(f"已核验 {len(result['pages'])} 页历史捕获。可设置新维度，再本地预览；尚未调用模型。")
                 elif kind == 'comparison_preview':
-                    self.show_plan(result)
+                    self.show_plan(result, instruction_ticket=instruction_ticket)
                     if self.comparison_source:
                         from .comparison_history import source_description
                         self.show_text(describe(result) + '\n' + source_description(self.comparison_source))
@@ -1410,6 +1749,8 @@ class GoalPanel:
                     self.text.edit_modified(False)
                     self.show_plan(result['plan'])
                     self.status.set(result['reason'])
+                elif kind == 'generated_scope':
+                    self.accept_generated_scope(result)
                 elif kind == 'office_scope':
                     from .office_scope_panel import open_scope_selector
                     self.status.set('文件已本地核验，请选择编辑范围；尚未调用模型。')
@@ -1435,8 +1776,15 @@ class GoalPanel:
                     self.control.configure(values=[f"{c['name'][:90]} · {c['type']}" for c in self.controls])
                     self.status.set('读取完成；预览与批准需在 120 秒内完成。')
                 elif kind == 'propose':
-                    self.show_plan(result['plan'])
+                    if self.show_plan(result['plan'], instruction_ticket=instruction_ticket,
+                                      planning_result=result) is False:
+                        continue
                     self.status.set(result['reason'])
+                    callback = getattr(self, 'on_office_planning_result', None)
+                    if '_office_continuation' in result and recovery is not None:
+                        recovery.on_result(result)
+                    elif callable(callback) and '_office_guard' in result:
+                        callback(result, instruction_ticket, result['_office_guard'])
         except queue.Empty:
             pass
         finally:

@@ -3,6 +3,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import uuid
+import re
 
 from .computer import ComputerError, digest, safe_root, write_new
 from .computer_agent import model_json, prepare, text
@@ -20,7 +21,9 @@ Do not edit formula cells; changing an input may cause existing formulas to reca
 Return {"kind":"edits","changes":[{"target":"exact candidate ID","after":"new value"}]}.
 Use JSON numbers/booleans/null for corresponding cell values, not string coercions.
 At most 20 changes total. No sending, deletion, creation of sheets, styling or scripts.
-For an ambiguous instruction return {"kind":"clarify","reason":"short question"};
+For an ambiguous instruction, a missing requested target, or a target outside the
+selected context return {"kind":"clarify","issue":"ambiguous|missing_target|out_of_scope",
+"reason":"short question"} using the applicable one issue. Never guess a target.
 for unsupported work return {"kind":"unsupported","reason":"short explanation"}.
 Explain in the user's language. Do not claim execution or success. Human diff approval
 and local source/preservation/native application checks are required afterwards.'''
@@ -70,7 +73,26 @@ def _goal(response, targets):
     return {'kind': 'interactive', 'browser': None, 'edits': edits}
 
 
-def propose(session, instruction, files, *, client=None, stop=lambda: False, artifact_refs=None, scope=None):
+def _verified_sources(session, paths, sources):
+    if type(sources) is not list or len(sources) != len(paths):
+        raise ComputerError('office_planning_sources_invalid')
+    for n, (path, source) in enumerate(zip(paths, sources), 1):
+        safe_root(path)
+        if (type(source) is not dict or set(source) - {'id','root','public','path','scope'}
+                or source.get('id') != f'e{n}' or source.get('path') != str(path)):
+            raise ComputerError('office_planning_sources_invalid')
+        root = safe_root(source['root'])
+        if root.parent != session.root / 'edit-inputs' or not re.fullmatch('[0-9a-f]{32}', root.name):
+            raise ComputerError('office_planning_sources_invalid')
+        from .computer import read_record
+        if (read_record(root / 'source.json') != {'original': str(path), 'public': source['public']}
+                or verify_edit_source(root) != source['public']):
+            raise ComputerError('office_planning_source_changed')
+    return deepcopy(sources)
+
+
+def propose(session, instruction, files, *, client=None, stop=lambda: False, artifact_refs=None, scope=None,
+            _sources=None, _record=None, _source_guard=None):
     """Read/snapshot locally, call the existing budgeted planner, then return a diff."""
     text(instruction, 1000)
     if (type(files) not in (list, tuple) or not 1 <= len(files) <= MAX_EDIT_FILES
@@ -85,18 +107,28 @@ def propose(session, instruction, files, *, client=None, stop=lambda: False, art
     if scope is not None and (type(scope) is not list or len(scope)!=len(files)):
         raise ComputerError('office_scope_selection_invalid')
     scope = deepcopy(scope)
-    record = safe_root(session.root / 'office-planning' / uuid.uuid4().hex)
+    record = safe_root(_record or session.root / 'office-planning' / uuid.uuid4().hex)
+    if record.parent != session.root / 'office-planning' or not re.fullmatch('[0-9a-f]{32}', record.name):
+        raise ComputerError('office_planning_record_invalid')
     record.mkdir(parents=True, exist_ok=False)
     try:
+        write_new(record / 'request.json', {'instruction': instruction,
+                  'files': [str(path) for path in paths],
+                  'artifact_refs': deepcopy(artifact_refs), 'scope': deepcopy(scope)})
         if artifact_refs is not None:
             from .office_handoff import verify_references
             artifact_refs = deepcopy(artifact_refs)
             verify_references(paths, artifact_refs)
             write_new(record / 'artifact-references.json', artifact_refs)
-        sources = []
+        sources = _verified_sources(session, paths, _sources) if _sources is not None else []
         for n, path in enumerate(paths, 1):
             if stop():
                 raise ComputerError('office_planning_cancelled')
+            if _sources is not None:
+                sources[n-1].pop('scope', None)
+                if scope is not None:
+                    sources[n-1]['scope'] = deepcopy(scope[n-1])
+                continue
             root = safe_root(session.root / 'edit-inputs' / uuid.uuid4().hex)
             root.mkdir(parents=True, exist_ok=False)
             public = snapshot_edit_source(path, root)
@@ -104,6 +136,7 @@ def propose(session, instruction, files, *, client=None, stop=lambda: False, art
                 raise ComputerError('office_handoff_snapshot_changed')
             sources.append({'id': f'e{n}', 'root': str(root), 'public': public, 'path':str(path),
                             **({'scope':scope[n-1]} if scope is not None else {})})
+        write_new(record / 'sources.json', sources)
         context, targets = _context(instruction, sources)
         if scope is not None:
             write_new(record / 'selection.json',scope)
@@ -111,6 +144,8 @@ def propose(session, instruction, files, *, client=None, stop=lambda: False, art
             if verify_edit_source(source['root']) != source['public']:
                 raise ComputerError('office_planning_source_changed')
         write_new(record / 'context.json', context)
+        if _source_guard is not None:
+            _source_guard()
         response = model_json(session, context, SYSTEM, client=client, stop=stop, max_tokens=1536)
         write_new(record / 'response.json', response)
         if stop():
@@ -121,12 +156,17 @@ def propose(session, instruction, files, *, client=None, stop=lambda: False, art
                 raise ComputerError('office_planning_source_changed')
         if artifact_refs is not None:
             verify_references(paths, artifact_refs)
-        if (type(response) is dict and set(response) == {'kind', 'reason'}
-                and response['kind'] in {'clarify', 'unsupported'}):
+        if _source_guard is not None:
+            _source_guard()
+        if (type(response) is dict and response.get('kind') in {'clarify', 'unsupported'}
+                and (set(response) == {'kind', 'reason'} or response['kind'] == 'clarify'
+                     and set(response) == {'kind', 'reason', 'issue'}
+                     and response['issue'] in {'ambiguous','missing_target','out_of_scope'})):
             result = {'plan': None, 'reason': text(response['reason'], 300)}
         else:
             result = {'plan': prepare(session, instruction, _goal(response, targets)),
                       'reason': '请核对所选文件、位置与全部原值/新值；批准后才在副本中执行并回读。'}
+        result['office_result'] = {'kind': response['kind'], 'record': str(record)}
         write_new(record / 'outcome.json', result)
         return result
     except Exception as exc:

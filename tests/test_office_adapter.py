@@ -26,7 +26,9 @@ def test_document_spec_is_copied_and_bounded():
     {"kind": "document", "title": "x", "paragraphs": [], "path": "C:/outside.docx"},
     {"kind": "document", "title": "x\nrun", "paragraphs": []},
     {"kind": "document", "title": "x", "paragraphs": ["a\x00b"]},
-    {"kind": "document", "title": "x", "paragraphs": ["a"] * 41},
+    {"kind": "document", "title": "x", "paragraphs": ["a"] * 321},
+    {"kind": "document", "title": "x", "paragraphs": ["a" * 3001]},
+    {"kind": "document", "title": "x", "paragraphs": ["a" * 3000] * 20},
     {"kind": "document", "title": "x", "paragraphs": [],
      "table": {"headers": ["a", "b"], "rows": [[1]]}},
     {"kind": "spreadsheet", "title": "x", "headers": ["n"], "rows": [["=1+1"]],
@@ -42,6 +44,18 @@ def test_document_spec_is_copied_and_bounded():
 def test_rejects_unsafe_or_ambiguous_specs(spec):
     with pytest.raises(ValueError):
         validate_spec(spec)
+
+
+@pytest.mark.parametrize("paragraphs", [
+    ["a"] * 320,
+    ["a" * 3000],
+    ["a" * 3000] * 19 + ["a" * 2999],
+])
+def test_document_capacity_boundaries_preserve_all_content(paragraphs):
+    raw = {"kind": "document", "title": "x", "paragraphs": paragraphs}
+    checked = validate_spec(raw)
+    assert checked == raw
+    assert checked["paragraphs"] is not paragraphs
 
 
 def test_preserves_formula_like_input_as_string():

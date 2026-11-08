@@ -166,7 +166,7 @@ def test_adapter_result_handoff_on_ui_thread(panel):
     assert '未保存' not in p.preview_box.get('1.0', 'end')
 
 
-def test_partial_adapter_keeps_completed_artifact_handoff(panel):
+def test_partial_adapter_keeps_completed_artifacts_without_automatic_handoff(panel):
     p, _ = panel
     records = [{'kind':'spreadsheet','path':'verified.xlsx'}]
     calls = []
@@ -174,7 +174,62 @@ def test_partial_adapter_keeps_completed_artifact_handoff(panel):
     p.messages.put(('execute', {'ok':False, 'mode':'adapters','code':'office_unknown',
                       'completed':[{}, {}], 'artifacts':records,'run':'evidence'}, None))
     p.poll()
-    assert calls == [records] and 'office_unknown' in p.status.get()
+    assert calls == [] and 'office_unknown' in p.status.get()
+    assert '成果保留，未自动接力' in p.status.get()
+
+
+def test_stopped_adapter_keeps_late_success_without_automatic_handoff(panel):
+    from copy import deepcopy
+    p, changes = panel
+    records = [{'kind': 'document', 'path': 'verified.docx'}]
+    result = {'ok': True, 'mode': 'adapters', 'completed': [{}],
+              'artifacts': records, 'run': 'retained-run'}
+    before = deepcopy(result)
+    calls = []
+    p.on_artifacts = calls.append
+    p.set_busy(True)
+    p.stop()
+    assert p.running and changes == [True]
+    p.messages.put(('execute', result, None))
+
+    p.poll()
+
+    assert not p.running and changes == [True, False]
+    assert p.stopped.is_set() and calls == []
+    assert result == before
+    assert '成果保留，未自动接力' in p.status.get()
+    assert 'verified.docx' in p.preview_box.get('1.0', 'end')
+
+
+def test_closed_adapter_ignores_queued_success_without_automatic_handoff(panel):
+    p, _ = panel
+    calls = []
+    p.on_artifacts = calls.append
+    p.messages.put(('execute', {'ok': True, 'mode': 'adapters', 'completed': [{}],
+                               'artifacts': [{'kind': 'document', 'path': 'saved.docx'}],
+                               'run': 'retained-run'}, None))
+    p.close()
+
+    p.poll()
+
+    assert p.closed and p.stopped.is_set() and calls == []
+    assert p.messages.qsize() == 1
+
+
+def test_stopped_repository_adapter_does_not_promise_automatic_handoff(panel):
+    p, _ = panel
+    calls = []
+    p.on_artifacts = calls.append
+    p.stop()
+    p.messages.put(('execute', {'ok': True, 'mode': 'adapters', 'completed': [{}],
+                               'artifacts': [{'kind': 'document', 'path': 'saved.docx'}],
+                               'repository_report': {'ok': True}, 'run': 'retained-run'}, None))
+
+    p.poll()
+
+    assert calls == []
+    text = p.preview_box.get('1.0', 'end')
+    assert '当前未自动接力' in text and '将自动接到下一任务' not in text
 
 
 def test_adapter_handoff_failure_preserves_result(panel):

@@ -1,5 +1,58 @@
 # Public snapshot checks
 
+## November 8, 2026 source update
+
+Source baseline: `c95715cc00d67a9c9d5fb7f2d01bb2c4719e9e3c`. The selected
+snapshot contains 217 production/launcher and 341 test Python files. The public
+repository retains its own history; the source identity is a provenance marker,
+not an import of the development repository's Git objects or history.
+
+The selected desktop source includes guarded Windows control providers,
+natural-language edits of observed Office targets, native readback, verified
+artifact handoff and recovery of supported remaining work. Optional Windows
+components are pinned and checked; upstream agent loops, runtime binaries and
+unrestricted upstream tools are not distributed as enabled capabilities.
+
+Cloud provider paths share persistent usage/cost accounting. Local owner
+authorization can select the limited or unlimited amount mode documented in
+the Quickstart; unresolved holds and accounting failures remain stop conditions.
+
+Development-machine evidence covers bounded WPS editing, normal restart and
+remaining-step continuation, subsequent Office edits, and one automatic Winapp
+selection with independent native verification. Separate retained evidence
+covers the MCP provider and selected-window annotation. These are distinct
+acceptances, not a claim that all combinations were tested in one run.
+
+The final mixed-workflow development acceptance completed Office → Windows →
+Office after a normal GUI restart. All 70 first-stage evidence/output files kept
+their original bytes and modification times. Native WPS verification confirmed
+one Word paragraph and two Excel cells changed, with styles and formulas
+preserved and a formula result of 54. The Windows stage selected the approved
+Explorer drive item once without opening it. The final two-file batch was
+handed to the next-task entry while preserving a new draft; no additional
+downstream task was executed. The associated 93 distinct targeted tests passed.
+These results were retained from development, not rerun during publication.
+
+The accepted adapter candidate's bounded trial allowance is exhausted. New
+Office execution requires the existing reviewed qualification/activation process;
+the release neither resets local counters nor grants fresh approval. Recovery
+branches not exercised by the live chain retain their offline-only evidence.
+Qualification refusal before planning leaves the step ready with no model call
+or child execution; a previously dispatched pending operation is still not
+automatically retried.
+
+Public preparation checks inspect the selected source, Python syntax,
+dependency closure, exact staged bytes, publication exclusions and retained
+public history. The final publication receipt records the source and public
+commit identities and completed checks. Native workflows and paid models are
+not rerun merely to synchronize source. Earlier test counts below remain
+historical and are not current test results.
+
+Private captures, mail, documents, receipts, ledgers, credentials and the private
+Git history are excluded. Fresh-machine installation, arbitrary Windows tasks,
+general Office compatibility and a complete voice-integrated assistant remain
+outside this release's acceptance. Unknown effects are not automatically replayed.
+
 ## October 24, 2026 update
 
 The selected source contains 129 production/launcher Python files and 192 test

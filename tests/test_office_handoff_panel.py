@@ -2,6 +2,8 @@
 import queue
 import threading
 from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
 
 from test_office_intent_panel import Value, panel_stub, install_dialog
 from agent_service import computer_goal_panel as ui
@@ -15,12 +17,14 @@ def _async_panel(monkeypatch, artifacts):
     panel.stopped = threading.Event()
     panel.set_busy = lambda _value: None
     panel.get_artifacts = lambda: artifacts
+    panel.text = Value('')
+    panel.session = SimpleNamespace(root=Path('session'))
     scheduled = []
     panel.start = lambda kind, operation: scheduled.append((kind, operation))
     return panel, scheduled
 
 
-def test_use_generated_artifacts_opens_selector_and_prepares_scope_without_model(monkeypatch):
+def test_use_generated_artifacts_prepares_bounded_scope_without_picker_or_model(monkeypatch):
     records = [{'path': 'a.docx', 'sha256': 'a' * 64}]
     panel, scheduled = _async_panel(monkeypatch, records)
     panel.office_planning_files = ('old.xlsx',)
@@ -44,10 +48,9 @@ def test_use_generated_artifacts_opens_selector_and_prepares_scope_without_model
 
     assert panel.office_planning_files == () and panel.office_artifact_refs is None and panel.office_scope is None
     assert panel.mode.get() == ui.MODES[9]
-    assert opened[0][0] == [{'path': 'a.docx', 'sha256': 'a' * 64}]
-    opened[0][1](opened[0][0])
-    assert scheduled[0][0] == 'office_scope'
-    assert scheduled[0][1](object()) == {'files': ['a.docx']}
+    assert opened == []
+    assert scheduled[0][0] == 'generated_scope'
+    assert scheduled[0][1](panel.session)['catalog'] == {'files': ['a.docx']}
     assert selected == [[{'path': 'a.docx', 'sha256': 'a' * 64}]]
     assert model_calls == []
 
@@ -120,7 +123,7 @@ def test_propose_passes_deepcopied_artifact_refs(monkeypatch):
     assert calls[0][1]['scope'] == [{'path': 'a.docx', 'locations': [{'at': 1}]}]
 
 
-def test_restart_empty_memory_discovers_batch_on_worker_then_opens_picker(monkeypatch):
+def test_restart_empty_memory_discovers_batch_on_worker_then_prepares_scope(monkeypatch):
     panel,scheduled=_async_panel(monkeypatch,[])
     records=[{'path':'recent.docx','sha256':'a'*64},{'path':'recent.xlsx','sha256':'b'*64}]
     calls=[];opened=[]
@@ -131,7 +134,7 @@ def test_restart_empty_memory_discovers_batch_on_worker_then_opens_picker(monkey
     result=scheduled[0][1](None)
     panel.messages.put(('generated_artifacts',result,None))
     panel.poll()
-    assert calls==['worker'] and opened==[records]
+    assert calls==['worker'] and opened==[] and scheduled[-1][0]=='generated_scope'
 
 
 def test_explicit_empty_batch_never_uses_history_fallback(monkeypatch):

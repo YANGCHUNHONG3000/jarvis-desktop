@@ -719,12 +719,19 @@ def _native_readback(path, spec, observed, check):
                        "after": c["after"]} for c in spec["changes"]]
         else:
             from . import workbook_source
+            if str(Path(owned.FullName).resolve()).casefold() != str(Path(path).resolve()).casefold():
+                raise EditError("edit_application_mismatch")
             expected_results, order = _formula_expectations(observed)
             if int(owned.Worksheets.Count) != len(observed["sheets"]):
                 raise EditError("edit_application_mismatch")
             for name, coordinate in order:
                 check()
-                owned.Worksheets.Item(name).Range(coordinate).Calculate()
+                target = owned.Worksheets.Item(name).Range(coordinate)
+                # WPS can regard a retained OOXML formula cache as already clean.
+                # Invalidate only this owned read-only workbook's formula cell;
+                # do not change a formula, save a cache, or calculate other books.
+                target.Dirty()
+                target.Calculate()
             formula_results = []
             bounds = {}
             from openpyxl.utils.cell import coordinate_to_tuple

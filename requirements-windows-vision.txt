@@ -1,0 +1,18 @@
+# Optional isolated CPU OCR runtime (Python 3.12). No cloud calls.
+# python -m venv data/vision_runtime
+# data/vision_runtime/Scripts/python.exe -m pip install -r requirements-windows-vision.txt
+# Do not install this into the frozen voice Runtime environment.
+colorama==0.4.6
+flatbuffers==25.12.19
+numpy==2.5.4
+onnxruntime==1.31.1
+opencv-python==5.0.0.93
+packaging==26.3
+pillow==13.0.0
+protobuf==7.36.2
+pyclipper==1.4.0
+PyYAML==6.0.3
+rapidocr-onnxruntime==1.4.4
+shapely==2.2.0
+six==1.17.0
+tqdm==4.70.1

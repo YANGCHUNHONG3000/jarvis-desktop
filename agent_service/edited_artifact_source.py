@@ -27,12 +27,23 @@ def prepare_reference(artifact, expected_sha256, base):
     record, record_hash = _load(step/'environment-result.json')
     intent, intent_hash = _load(step/'environment-intent.json')
     if (record['intent_sha256'] != intent_hash or record['action'] != intent['action']
-            or record['action']['kind'] != 'office_edit' or record['result'].get('ok') is not True):
+            or record['action']['kind'] != 'office_edit'):
         raise ValueError('edited_artifact_receipt_invalid')
     item = next((e for e in goal['edits'] if e['id']==record['action']['edit_id']),None)
     if item is None or item['source_root'] != manifest['source_root'] or item['spec'] != manifest['spec']:
         raise ValueError('edited_artifact_spec_invalid')
-    native = verify_edit_result(record['native'],manifest['source_root'],manifest['spec'])
+    from .computer_interaction import verify_location
+    verify_location(item)
+    if record['result'].get('ok') is True:
+        native = verify_edit_result(record['native'],manifest['source_root'],manifest['spec'])
+    else:
+        from .office_edit_recheck import verify
+        try:
+            checked = verify(artifact, expected_sha256, base=base)
+        except (OSError, ValueError) as exc:
+            raise ValueError('edited_artifact_receipt_invalid') from exc
+        native = checked['native']
+        record_hash = digest({'original_result': record_hash, 'native_recheck': checked['proof_sha256']})
     if native['artifact'] != str(artifact) or native['sha256'] != expected_sha256:
         raise ValueError('edited_artifact_changed')
     return {'version':1,'kind':'office_edit','artifact':str(artifact),'sha256':expected_sha256,

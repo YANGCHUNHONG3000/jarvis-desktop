@@ -63,7 +63,7 @@ def _function_state(callback):
 
 
 def _goal_panel():
-    callback = _button("整批用于能力模式").options["command"]
+    callback = _button("用于能力模式").options["command"]
     selection = _function_state(callback)["select_history_artifact_batch"]
     return _function_state(selection)["goal_panel"]
 
@@ -90,7 +90,7 @@ def test_selected_historical_batch_passes_all_office_artifacts(gui_compat, deskt
     root, task_root, state, tree, _original = desktop
     artifacts = _history_batch(root, task_root, state, tree, count=4, duplicate_labels=True)
     panel = _goal_panel()
-    button = _button("整批用于能力模式")
+    button = _button("用于能力模式")
 
     assert button.options["state"] == "normal"
     button.invoke()
@@ -102,11 +102,25 @@ def test_selected_historical_batch_passes_all_office_artifacts(gui_compat, deskt
     assert is_current()
 
 
+def test_single_historical_mail_word_can_enter_capability_mode(gui_compat, desktop):
+    root, task_root, state, tree, _original = desktop
+    artifacts = _history_batch(root, task_root, state, tree, count=1)
+    panel = _goal_panel()
+    button = _button("用于能力模式")
+
+    assert button.options["state"] == "normal"
+    button.invoke()
+
+    task_id, records, is_current = panel.calls[0]
+    assert records == [{"path": artifacts[0]["path"], "sha256": artifacts[0]["sha256"]}]
+    assert task_id and is_current()
+
+
 def test_historical_batch_over_four_is_rejected_without_truncation(gui_compat, desktop):
     root, task_root, state, tree, _original = desktop
     _history_batch(root, task_root, state, tree, count=5)
     panel = _goal_panel()
-    button = _button("整批用于能力模式")
+    button = _button("用于能力模式")
 
     assert button.options["state"] == "disabled"
     button.invoke()
@@ -117,7 +131,7 @@ def test_history_reselection_invalidates_captured_batch_binding(gui_compat, desk
     root, task_root, state, tree, _original = desktop
     _history_batch(root, task_root, state, tree)
     panel = _goal_panel()
-    button = _button("整批用于能力模式")
+    button = _button("用于能力模式")
     button.invoke()
     _, _, is_current = panel.calls[0]
 
@@ -130,7 +144,7 @@ def test_history_batch_entry_guards_busy_and_uninspected_selection(gui_compat, d
     root, task_root, state, tree, _original = desktop
     _history_batch(root, task_root, state, tree)
     panel = _goal_panel()
-    button = _button("整批用于能力模式")
+    button = _button("用于能力模式")
     panel.running = True
     button.invoke()
     panel.running = False
@@ -185,6 +199,22 @@ def test_goal_panel_rechecks_and_keeps_complete_history_batch(goal_panel, monkey
     assert panel.capability_history_seed['records'] == records
     assert 'task-history-1' in panel.capability_source_label.get()
     assert str(panel.office_bundle_button['state']) == 'normal'
+
+
+def test_goal_panel_accepts_one_history_source_without_enabling_joint_comparison(goal_panel, monkeypatch):
+    panel = goal_panel
+    records, refs, calls, pending, _current = _begin_history_seed(panel, monkeypatch, 1)
+
+    assert len(pending) == 1 and pending[0][0] == 'capability_sources'
+    selected = pending[0][1](object())
+    assert calls == [records]
+    assert selected['refs'] == refs and selected['task_id'] == 'task-history-1'
+    panel.messages.put(('capability_sources', selected, None))
+    panel.poll()
+
+    assert panel.capability_sources == refs and len(panel.capability_sources) == 1
+    assert str(panel.daily_task_route_button['state']) == 'normal'
+    assert str(panel.office_bundle_button['state']) == 'disabled'
 
 
 def test_goal_panel_rejects_over_limit_without_truncating(goal_panel, monkeypatch):

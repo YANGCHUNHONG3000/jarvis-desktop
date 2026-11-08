@@ -27,10 +27,12 @@ _DENY_PROCESS = {"cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe",
                  "python.exe", "pythonw.exe", "mshta.exe", "regedit.exe",
                  "taskmgr.exe", "sechealthui.exe", "systemsettings.exe",
                  "microsoft.cmdpal.ui.exe", "workbuddy.exe", "textinputhost.exe"}
-_DENY_TITLE = re.compile(
-    r"terminal|powershell|command prompt|credential|password|sign.?in|log.?in|"
-    r"authentication|windows security|user account control|codex|chatgpt|jarvis|"
-    r"终端|命令提示符|密码|凭据|登录|身份验证|安全中心|用户账户控制|贾维斯", re.I)
+_SENSITIVE_TITLE_PATTERN = (r"terminal|powershell|command prompt|credential|password|sign.?in|log.?in|"
+    r"authentication|windows security|user account control|终端|命令提示符|密码|凭据|登录|身份验证|安全中心|用户账户控制")
+_BRAND_TITLE_PATTERN = r"codex|chatgpt|jarvis|贾维斯"
+_DENY_SENSITIVE_TITLE = re.compile(_SENSITIVE_TITLE_PATTERN, re.I)
+_DENY_BRAND_TITLE = re.compile(_BRAND_TITLE_PATTERN, re.I)
+_DENY_TITLE = re.compile(_SENSITIVE_TITLE_PATTERN + '|' + _BRAND_TITLE_PATTERN, re.I)
 
 
 class UIAError(RuntimeError):
@@ -82,7 +84,7 @@ def _identity(hwnd):
         raise UIAError("window_unavailable")
     title = win32gui.GetWindowText(hwnd)
     class_name = win32gui.GetClassName(hwnd)
-    if not title or len(title) > 300 or _DENY_TITLE.search(title):
+    if not title or len(title) > 300 or _DENY_SENSITIVE_TITLE.search(title):
         raise UIAError("window_denied")
     if class_name in {'Progman', 'WorkerW', 'Shell_TrayWnd', 'PseudoConsoleWindow'}:
         raise UIAError('window_denied')
@@ -114,6 +116,8 @@ def _identity(hwnd):
         profile = 'observe_only'
     if profile == 'explorer' and class_name != 'CabinetWClass':
         profile = 'observe_only'
+    if _DENY_BRAND_TITLE.search(title) and not (profile == 'explorer' and class_name == 'CabinetWClass'):
+        raise UIAError('window_denied')
     return dict(hwnd=hwnd, pid=pid, created=created, image=image,
                 class_name=class_name, title=title, profile=profile)
 

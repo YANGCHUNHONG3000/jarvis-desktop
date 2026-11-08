@@ -64,7 +64,7 @@ class ComputerPanel:
         self.instruction = ttk.Entry(tab)
         self.instruction.pack(fill='x')
         ttk.Label(tab, text='上框填写下一步目标。点击云端建议将上传当前所选窗口的控件文字及目标；'
-                  '每会话最多 6 次，沿用每日及滚动 24 小时各 ¥5 上限。', wraplength=700).pack(anchor='w')
+                  '每会话最多 6 次，沿用当前本地费用设置与共享账本。', wraplength=700).pack(anchor='w')
         ttk.Button(tab, text='云端建议下一步（上传所选窗口内容）', command=self.propose).pack(anchor='w', pady=5)
         self.preview_text = tk.StringVar(value='尚无操作预览。')
         ttk.Label(tab, textvariable=self.preview_text, wraplength=700).pack(anchor='w')

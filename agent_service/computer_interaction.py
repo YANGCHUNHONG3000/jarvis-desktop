@@ -32,7 +32,9 @@ def validate_goal(goal):
             raise ComputerError('page_office_scope_invalid')
     seen = set()
     for item in value['edits']:
-        if (type(item) is not dict or set(item) != {'id','source_root','spec','after_browser'}
+        if (type(item) is not dict or set(item) not in ({'id','source_root','spec','after_browser'},
+                {'id','source_root','spec','after_browser','location'},
+                {'id','source_root','spec','after_browser','locations'})
                 or type(item['id']) is not str or item['id'] not in {f'e{n}' for n in range(1,MAX_EDIT_FILES+1)}
                 or item['id'] in seen or type(item['after_browser']) is not bool
                 or (item['after_browser'] and value['browser'] is None)
@@ -41,7 +43,45 @@ def validate_goal(goal):
             raise ComputerError('interaction_edit_invalid')
         seen.add(item['id'])
         item['spec'] = validate_edit_spec(item['spec'])
+        if 'location' in item and (type(item['location']) is not dict
+                or set(item['location']) != {'ref', 'after'} or type(item['location']['ref']) is not dict):
+            raise ComputerError('interaction_location_invalid')
+        if 'locations' in item and (type(item['locations']) is not list
+                or not 1 <= len(item['locations']) <= 20 or any(
+                    type(part) is not dict or set(part) != {'ref', 'after'} or type(part['ref']) is not dict
+                    for part in item['locations'])):
+            raise ComputerError('interaction_location_invalid')
+    if sum(len(item.get('locations', [])) + int('location' in item) for item in value['edits']) > 20:
+        raise ComputerError('interaction_location_limit')
     return value
+
+
+def verify_location(item):
+    """Re-derive the exact edit; provenance may not expand the writable range."""
+    if 'location' not in item and 'locations' not in item:
+        return
+    if 'location' in item and 'locations' in item:
+        raise ComputerError('interaction_location_invalid')
+    from .windows_located_edit import derive, derive_many
+    from .windows_content_query import decode
+    from .office_edit import verify_edit_source, _read
+    if 'locations' in item:
+        requests = derive_many(item['locations'])
+        if len(requests) != 1:
+            raise ComputerError('interaction_location_changed')
+        requested = requests[0]
+        location = item['locations'][0]
+    else:
+        location = item['location']
+        requested = derive(location['ref'], location['after'])
+    original = _read(Path(item['source_root']) / 'source.json')['original']
+    source = verify_edit_source(item['source_root'])
+    snapshot = decode(location['ref']['token'])['file']
+    if (str(Path(original).resolve()) != str(Path(requested['path']).resolve())
+            or source['sha256'] != snapshot['sha256']
+            or item['spec']['source_sha256'] != snapshot['sha256']
+            or item['spec']['changes'] != requested['changes']):
+        raise ComputerError('interaction_location_changed')
 
 
 def prepare(session, instruction, *, browser=None, edits=(), repository_document=False, page_office=False):
@@ -52,7 +92,8 @@ def prepare(session, instruction, *, browser=None, edits=(), repository_document
         raise ComputerError('interaction_edit_invalid')
     records = []
     for n, item in enumerate(edits, 1):
-        if type(item) is not dict or set(item) - {'path','changes','after_browser'} or not {'path','changes'} <= item.keys():
+        if (type(item) is not dict or set(item) - {'path','changes','after_browser','location','locations'}
+                or not {'path','changes'} <= item.keys() or {'location','locations'} <= item.keys()):
             raise ComputerError('interaction_edit_invalid')
         root = safe_root(session.root/'edit-inputs'/uuid.uuid4().hex)
         root.mkdir(parents=True, exist_ok=False)
@@ -62,6 +103,12 @@ def prepare(session, instruction, *, browser=None, edits=(), repository_document
         spec, _ = _bind(spec, root)
         records.append({'id':f'e{n}', 'source_root':str(root), 'spec':spec,
                         'after_browser':item.get('after_browser', browser is not None)})
+        if 'location' in item:
+            records[-1]['location'] = deepcopy(item['location'])
+            verify_location(records[-1])
+        elif 'locations' in item:
+            records[-1]['locations'] = deepcopy(item['locations'])
+            verify_location(records[-1])
     goal = {'kind':'interactive','browser':browser,'edits':records}
     if type(repository_document) is not bool:
         raise ComputerError('repository_document_scope_invalid')
@@ -141,7 +188,7 @@ def describe(plan):
          '公开搜索仅向模型提供任务与候选元数据，办公原文不随结果选择上传。'
          if goal['browser'] and goal['browser'].get('mode') == 'public_search' else
          '多候选时任务、批准变更及有限页面文字会提供给云模型；单候选不调用模型。'),
-        '12 动作 / 360 秒 / 会话最多 6 次模型调用；原共享每日和滚动 24 小时各 ¥5。',
+        '12 动作 / 360 秒 / 会话最多 6 次模型调用；沿用当前本地费用设置与共享账本。',
         '未知效果立即停止；成果自动接到下一任务。登录仅人工接管；不支持发送、付款或任意页面控件。'])
 
 
@@ -196,6 +243,7 @@ class InteractionEnvironment:
             raise ComputerError('interaction_goal_changed')
         edits = {e['id']:e for e in self.goal['edits']}
         for item in edits.values():
+            verify_location(item)
             if verify_edit_source(item['source_root'])['sha256'] != item['spec']['source_sha256']:
                 raise ComputerError('interaction_source_changed')
         done, started, failures, artifacts, hashes = [], [], [], [], []
@@ -276,6 +324,10 @@ class InteractionEnvironment:
                 continue
             if not item['after_browser'] or observation['checks']['sources_ready']:
                 actions.append({'kind':'office_edit','edit_id':item['id']})
+        if self.goal['browser'] is None:
+            # The approved plan already fixes file order; no model selection is
+            # needed between Office edits, including natural-language plans.
+            return actions[:1]
         if (self.goal['browser'] and self.goal['browser'].get('mode') in {'github_repo','public_search'}
                 and observation['checks']['sources_ready']):
             # Approved edits have a fixed order; keep private page captures local.

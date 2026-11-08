@@ -48,6 +48,15 @@ def panel_stub():
     panel.office_planning_files = ()
     panel.office_artifact_refs = None
     panel.office_scope = None
+    panel.daily_task_route_generation = panel.capability_source_generation = 0
+    panel.capability_sources_validated_generation = None
+    panel.capability_history_seed = None
+    panel.capability_sources = []
+    panel.external_activity_seen = False
+    panel.capability_clarification_button = Value()
+    panel.daily_task_route_button = Value()
+    panel.office_bundle_button = Value()
+    panel.capability_previous_button = Value()
     panel.output_edit_button = Value()
     panel.execute_button = Value()
     panel.preview_box = PreviewBox()
@@ -83,7 +92,7 @@ def test_propose_routes_selected_files_and_instruction(monkeypatch):
     panel.office_artifact_refs = None
     panel.office_scope = None
     panel.text = Value('把预算状态改为已确认')
-    panel.stopped = SimpleNamespace(is_set=lambda: False)
+    panel.stopped = threading.Event()
     panel.invalidate = lambda: None
     scheduled = []
     panel.start = lambda kind, operation: scheduled.append((kind, operation))

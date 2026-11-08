@@ -162,7 +162,12 @@ def test_same_observed_engine_browser_before_office_real_xml_refs_and_next_word_
             source = artifact_source.snapshot_artifact_source(ref,target,ctx['task_base'])
             assert source['sha256'] == item['sha256']
             assert source['observed']['paragraphs'][1] == '预算已确认'
-            assert read_record(target/'sources'/'provenance.json') == ref
+            provenance = read_record(target/'sources'/'provenance.json')
+            assert provenance['kind'] == 'verified_edited_document'
+            assert provenance['edited'] == ref
+            from agent_service.verified_edit_document import verify_snapshot
+            assert verify_snapshot(target, source, provenance, ctx['task_base']) == (
+                source['kind'], source['observed'], source['coverage'])
         else:
             book = load_workbook(item['path'],data_only=False)
             try:

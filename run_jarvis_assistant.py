@@ -93,6 +93,8 @@ def _history_state_label(state):
 
 
 def _history_list_state_label(state):
+    if state == "needs_input":
+        return "记录待补充·待核验"
     if state == "succeeded":
         return "记录成功·待核验"
     if state == "recovered":
@@ -155,6 +157,7 @@ def _resume_reason_label(reason):
         "resume_unavailable": "续跑条件尚未满足",
         "resume_parent_invalid": "原任务结果无法核验",
         "resume_parent_mismatch": "原任务成果与步骤回执不一致",
+        "mail_analysis_binding_invalid": "邮件来源、复核或父子任务绑定无法核验；未展示成果",
         "resume_unclaimed_receipts": "存在未经可信续跑记录确认的中间成果，需人工核查",
         "resume_workflow_scope_invalid": "办公工作流目录无法核验",
         "resume_workflow_ambiguous": "办公工作流目录不唯一",
@@ -199,6 +202,61 @@ def _resume_reason_label(reason):
         "unknown": "执行结果待核验", "failed": "继续执行未完成",
     }
     return labels.get(reason, "暂不可继续，请核验任务记录")
+
+
+def _mail_understanding_error_label(result):
+    """Show bounded model questions/review reasons as text, never as actions."""
+    code = result.get("error") if type(result) is dict else None
+    labels = {
+        "mail_analysis_requires_export": "所选文件不是可核验的邮件导出，请重新选择邮件 Word。",
+        "mail_analysis_source_changed": "邮件来源或导出内容已变化，请重新选择并核验。",
+        "mail_analysis_schema_invalid": "邮件分析结果结构不符合要求。",
+        "mail_analysis_reply_invalid": "回复草稿的结构、空收件人或附件引用未通过核验；未生成文件。",
+        "mail_analysis_scope_invalid": "邮件正文范围无法核验，请明确需要整理的人员、主题或日期。",
+        "mail_analysis_schedule_missing": "整理结果遗漏或改变了原文星期日程；未继续生成文件，请核对原任务记录。",
+        "mail_analysis_formats_invalid": "邮件分析请求的输出格式不受支持。",
+        "mail_analysis_evidence_invalid": "邮件原文依据无法核验。",
+        "mail_analysis_field_unquoted": "负责人或期限缺少邮件原文依据。",
+        "mail_analysis_review_invalid": "邮件语义复核记录无法核验。",
+        "mail_analysis_review_rejected": "邮件语义复核未通过。",
+        "mail_analysis_plan_changed": "审核后的邮件计划或待执行步骤已变化。",
+        "mail_analysis_request_changed": "邮件分析请求记录已变化。",
+        "mail_analysis_content_limit": "邮件正文超出当前分析范围。",
+        "model_response_incomplete": "模型回复被截断，未生成办公成果；原邮件与失败记录已保留。请缩小整理范围或在修复后重新发起。",
+        "mail_analysis_needs_input": "邮件任务需要补充范围或意图。",
+        "mail_analysis_unsupported": "当前邮件能力暂不支持此任务。",
+        "request_changed": "任务原文在分析期间已变化。",
+        "task_cancelled": "邮件理解任务已停止。",
+        "task_deadline": "邮件理解任务超时。",
+    }
+    message = labels.get(code, "邮件理解未完成；请在历史任务中核验结果。")
+    if code in {"mail_analysis_needs_input", "mail_analysis_unsupported"} and type(result) is dict:
+        reason = result.get("reason")
+        if isinstance(reason, str):
+            reason = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", reason).split())[:160]
+            if reason:
+                message += "问题：" + reason + "。"
+        message += "请在任务框补充后重新点击“理解邮件”；原记录保留。"
+    elif code == "mail_analysis_review_rejected" and type(result) is dict:
+        reason = result.get("reason")
+        if isinstance(reason, str):
+            reason = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", reason).split())[:160]
+            if reason:
+                message += "复核理由：" + reason
+    return message
+
+
+def _mail_understanding_success_label(outputs, completed_count):
+    message = f"邮件理解完成；已核验 {len(outputs)} 个文件，完成步骤 {completed_count} 个。"
+    if any(path.suffix.lower() == ".eml" for _, path in outputs):
+        message += "回复草稿仅保存在本机，尚未发送；收件人留空，请先检查内容。"
+    return message
+
+
+def _clean_mail_followup_question(value):
+    if not isinstance(value, str):
+        return ""
+    return " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", value).split())[:160]
 
 
 def _resume_handoff_outputs(inspection, outcome, task_root, attempt_id):
@@ -400,9 +458,12 @@ def _last_json_lines(output):
     return {}
 
 
-def _task_command(request, task_root, source_file=None, source_artifact=None, source_retry=None):
+def _task_command(request, task_root, source_file=None, source_artifact=None, source_retry=None,
+                  mail_understanding=False, mail_review_resume=None):
     if sum(value is not None for value in (source_file, source_artifact, source_retry)) > 1:
         raise ValueError("source_ambiguous")
+    if mail_understanding and source_artifact is None:
+        raise ValueError("mail_understanding_source_required")
     command = [PYTHON, str(ROOT / "run_jarvis_task.py"), "--text-file", str(request),
                "--root", str(TASK_ROOT), "--task-root", str(task_root)]
     if source_file:
@@ -418,6 +479,18 @@ def _task_command(request, task_root, source_file=None, source_artifact=None, so
             raise ValueError("source_retry_invalid")
         command.extend(["--source-retry-json", json.dumps(source_retry,
                         ensure_ascii=False, sort_keys=True, separators=(",", ":"))])
+    if mail_understanding:
+        command.append("--mail-understanding")
+    if mail_review_resume is not None:
+        if (not mail_understanding or source_artifact is None
+                or type(mail_review_resume) is not dict
+                or set(mail_review_resume) != {'task_root', 'token'}
+                or type(mail_review_resume['task_root']) is not str
+                or type(mail_review_resume['token']) is not str
+                or re.fullmatch(r'[0-9a-f]{64}', mail_review_resume['token']) is None):
+            raise ValueError('mail_review_resume_invalid')
+        command.extend(['--mail-review-resume-json', json.dumps(
+            mail_review_resume, ensure_ascii=False, sort_keys=True, separators=(',', ':'))])
     return command
 
 
@@ -464,7 +537,7 @@ def main(argv=None):
 
     root = tk.Tk()
     root.title("Jarvis · 个人助手")
-    root.geometry("780x720")
+    root.geometry("780x800")
     messages = queue.Queue()
     history_messages = queue.Queue()
     mail_export_messages = queue.Queue()
@@ -472,7 +545,8 @@ def main(argv=None):
     skill_messages = queue.Queue()
     active = {"kind": None, "process": None, "stop": False, "task_root": None,
               "stop_deadline": None, "attempt_id": None, "attempt_root": None,
-              "history_id": None, "verify_deadline": None}
+              "history_id": None, "verify_deadline": None,
+              "mail_understanding": False}
     last_paths = {"notepad": None, "research": None, "agent": None}
     initial_source = _source_file_argument(argv)
     agent_outputs = {}
@@ -491,20 +565,59 @@ def main(argv=None):
     tabs.add(history_tab, text="历史任务")
     tabs.add(capability_tab, text="本机能力")
     from agent_service.computer_panel import attach_computer_tab
+
+    def invalidate_mail_followup_pending():
+        # A read-only mail preparation must become stale after any other
+        # activity begins, even if that activity ends before its callback.
+        try:
+            mail_followup_state.update(
+                generation=mail_followup_state["generation"] + 1,
+                pending=False, deadline=None, context=None)
+        except NameError:
+            # Panels may report their initial state while the UI is built.
+            pass
+
+    def notify_goal_external_activity(active_now=True, force=False):
+        if active_now:
+            try:
+                mail_navigation_panel.invalidate()
+            except NameError:
+                pass  # Some panels notify while the UI is still being constructed.
+            invalidate_mail_followup_pending()
+        try:
+            panel = goal_panel
+        except NameError:
+            panel = None
+        notify = getattr(panel, 'notify_external_activity', None)
+        if callable(notify):
+            notify(active_now, force=force)
+
     def computer_busy_changed(value):
         active.update(kind='computer' if value else None)
         notify_goal_external_activity(bool(value), force=bool(value))
 
     computer_panel = attach_computer_tab(tabs, root, busy=lambda: active['kind'] is not None,
                                         on_busy=computer_busy_changed)
+    from agent_service.windows_panel import attach_windows_tab
+    def windows_busy_changed(value):
+        active.update(kind='windows_task' if value else None)
+        notify_goal_external_activity(bool(value), force=bool(value))
+    windows_panel = attach_windows_tab(tabs, root, busy=lambda: active['kind'] is not None,
+                                      on_busy=windows_busy_changed)
     from agent_service.computer_goal_panel import attach_goal_tab
     def goal_busy_changed(value):
         active.update(kind='computer_goal' if value else None)
+        if value:
+            invalidate_mail_followup_pending()
+            try:
+                mail_navigation_panel.invalidate()
+            except NameError:
+                pass
         if not value and history_selected.get('inspection') is not None:
             count = sum(path.suffix.lower() in {'.docx', '.xlsx'}
                         for path, _sha in history_artifacts.values())
             history_batch_button.configure(
-                state='normal' if active['kind'] is None and 2 <= count <= 4
+                state='normal' if active['kind'] is None and 1 <= count <= 4
                 and not source_choice['pending'] else 'disabled')
 
     goal_panel = attach_goal_tab(tabs, root, busy=lambda: active['kind'] is not None,
@@ -514,11 +627,6 @@ def main(argv=None):
         invalidate = getattr(goal_panel, 'invalidate_history_batch_source', None)
         if callable(invalidate):
             invalidate(reason)
-
-    def notify_goal_external_activity(active_now=True, force=False):
-        notify = getattr(goal_panel, 'notify_external_activity', None)
-        if callable(notify):
-            notify(active_now, force=force)
 
     from agent_service.mailbox_panel import attach_mailbox_tab
     mailbox_tab = attach_mailbox_tab(tabs, root, lambda snapshot: start_mail_export(snapshot))
@@ -608,15 +716,57 @@ def main(argv=None):
 
     ttk.Label(task_tab, text="用自己的话描述任务：").pack(anchor="w")
     task_text = tk.Text(task_tab, height=6, wrap="word")
+    from agent_service.instruction_draft import InstructionDraft
+    task_draft = InstructionDraft(task_text)
+    submitted_instruction = {'task_root': None, 'ticket': None}
+    routed_instruction = {'main': None, 'goal': None}
+    office_chain = None
+    office_chain_route_binding = None
     task_text.pack(fill="both", expand=True, pady=8)
+    instruction_state = tk.StringVar(value="完整成功后自动清空未改动的指令；你新写的草稿会保留。")
+    ttk.Label(task_tab, textvariable=instruction_state, wraplength=620).pack(anchor='w')
+
+    def complete_main_instruction(ticket):
+        if type(ticket) is not dict:
+            return
+        cleared = task_draft.complete(ticket)
+        instruction_state.set('上一指令已完成，可直接写下一任务；成果仍可继续使用。' if cleared else
+                              '上一指令已完成；当前新草稿已保留，成果仍可继续使用。')
+        return cleared
+
+    def complete_submitted_instruction(task_root):
+        if task_root is not None and str(task_root) == submitted_instruction['task_root']:
+            ticket = submitted_instruction['ticket']
+            submitted_instruction.update(task_root=None, ticket=None)
+            complete_main_instruction(ticket)
+
+    def goal_instruction_completed(ticket):
+        if ticket == routed_instruction['goal'] and routed_instruction['main'] is not None:
+            source_ticket = routed_instruction['main']
+            routed_instruction.update(main=None, goal=None)
+            cleared = complete_main_instruction(source_ticket)
+            if office_chain is not None:
+                office_chain.instruction_cleared(source_ticket, cleared)
+
+    goal_panel.on_instruction_complete = goal_instruction_completed
+    recovery_submission = {'binding': None}
+
+    def approve_goal_with_recovery_instruction():
+        from agent_service.recovery_instruction import capture
+        recovery_submission['binding'] = capture(goal_panel)
+        goal_panel.execute()
+
+    goal_panel.execute_button.configure(command=approve_goal_with_recovery_instruction)
     ttk.Label(task_tab, text="例如：查资料并保存带来源的摘要；或把所选 Word 的唯一表格按原文转为 Excel 并写 Word 报告。"
               "表格提取保留已有合计，不重新计算，也不复制原文档其他段落。",
               wraplength=620).pack(anchor="w", pady=4)
     source_choice = {"path": str(initial_source) if isinstance(initial_source, Path) else "",
                      "artifact_ref": None, "retry_ref": None, "retry_instruction": None,
                      "retry_changed": False, "auto_required": False,
+                     "mail_export_source": False,
                      "generation": 0, "pending": False,
                      "pending_deadline": None, "setting": False}
+    mail_understanding_button = None
     skill_gate = {"generation": 0, "id": None, "enabled": False, "digest": None,
                   "checking": False, "deadline": None}
     skill_run_root = {"root": None}
@@ -634,6 +784,7 @@ def main(argv=None):
             source_choice["retry_ref"] = None
             source_choice["retry_instruction"] = None
             source_choice["retry_changed"] = False
+            source_choice["mail_export_source"] = False
             source_choice["path"] = selected
             source_label.set(selected)
             source_clear.configure(state="normal")
@@ -644,12 +795,14 @@ def main(argv=None):
         source_choice["retry_ref"] = None
         source_choice["retry_instruction"] = None
         source_choice["retry_changed"] = False
+        source_choice["mail_export_source"] = False
         source_choice["generation"] += 1
         source_choice["pending"] = False
         source_choice["pending_deadline"] = None
         source_choice["path"] = ""
         source_label.set("")
         source_clear.configure(state="disabled")
+        update_mail_understanding_button()
 
     source_row = ttk.Frame(task_tab)
     source_row.pack(fill="x", anchor="w", pady=3)
@@ -668,6 +821,7 @@ def main(argv=None):
             source_choice["artifact_ref"] = None
             source_choice["retry_ref"] = None
             source_choice["retry_instruction"] = None
+            source_choice["mail_export_source"] = False
             source_choice["generation"] += 1
             source_choice["pending"] = False
             source_choice["pending_deadline"] = None
@@ -675,6 +829,7 @@ def main(argv=None):
         source_clear.configure(state="normal" if source_label.get().strip()
                                and active["kind"] is None else "disabled")
         update_skill_button()
+        update_mail_understanding_button()
 
     source_label.trace_add("write", source_text_changed)
 
@@ -855,19 +1010,25 @@ def main(argv=None):
         budget_clock["updated"] = time.monotonic()
         try:
             from agent_service.budget import BudgetLedger
+            from agent_service.model import configured_model_label
+            from agent_service.budget_display import budget_status_text
             budget = BudgetLedger().snapshot()
-            budget_status.set(f"每日模型预算 ¥5.00 · 今日计账 ¥{budget['charged_micro']/1e6:.4f}"
-                              f" · 可用 ¥{budget['remaining_micro']/1e6:.4f}"
-                              + (f" · 待核费用 ¥{budget['held_micro']/1e6:.4f}" if budget['held_micro'] else ""))
+            budget_status.set(budget_status_text(budget, configured_model_label()))
         except Exception:
             budget_status.set("费用账本暂不可读；模型任务会在预算检查失败时停止。")
 
     def load_history():
+        mail_review_panel.invalidate()
+        mail_navigation_panel.invalidate()
         invalidate_history_batch_source(
             "历史列表正在刷新；原历史批次已失效，请重新检查并选择。")
+        mail_followup_state.update(generation=mail_followup_state["generation"] + 1,
+                                   pending=False, deadline=None, context=None, prepared=False)
+        history_followup_button.configure(state="disabled")
         history_scan["generation"] += 1
         generation = history_scan["generation"]
         only_gaps = gap_only.get()
+        list_limit = 200 if only_gaps or history_older.get() else 30
         if active["kind"] not in {"resume", "resume_verifying"}:
             history_selected["id"] = None
             history_selected["generation"] += 1
@@ -886,7 +1047,7 @@ def main(argv=None):
         def work():
             try:
                 from agent_service.task_history import list_tasks
-                records = list_tasks(TASK_ROOT, limit=200 if only_gaps else 30)
+                records = list_tasks(TASK_ROOT, limit=list_limit)
                 if only_gaps:
                     records = [item for item in records if item.get("state") == "unsupported"]
                 history_messages.put(("list", generation, records))
@@ -895,6 +1056,8 @@ def main(argv=None):
         threading.Thread(target=work, daemon=True, name="jarvis-history-list").start()
 
     def inspect_history_selection(_event=None):
+        mail_review_panel.invalidate()
+        mail_navigation_panel.invalidate()
         if active["kind"] in {"resume", "resume_verifying"}:
             owned_id = active.get("history_id")
             if owned_id and history_list.selection() != (owned_id,):
@@ -902,15 +1065,23 @@ def main(argv=None):
             return
         selected = history_list.selection()
         if not selected:
+            # load_history already invalidated the selected batch before its
+            # asynchronous row rebuild. Tk can emit another empty selection
+            # event while those rows are deleted; it is not a new user change.
+            if history_selected['id'] is None and history_selected['inspection'] is None:
+                return
             invalidate_history_batch_source(
                 "历史选择已清除；原历史批次已失效，请重新选择并核验。")
             history_selected["generation"] += 1
             history_selected["id"] = None
             history_selected["inspection"] = None
+            mail_followup_state.update(generation=mail_followup_state["generation"] + 1,
+                                       pending=False, deadline=None, context=None, prepared=False)
             history_artifacts.clear()
             history_output_list.configure(values=())
             history_output_choice.set("")
             history_batch_button.configure(state="disabled")
+            history_followup_button.configure(state="disabled")
             return
         task_id = selected[0]
         record = history_records.get(task_id)
@@ -920,6 +1091,8 @@ def main(argv=None):
             "历史选择已变化；原历史批次已失效，请重新选择并核验。")
         history_selected["id"] = task_id
         history_selected["generation"] += 1
+        mail_followup_state.update(generation=mail_followup_state["generation"] + 1,
+                                   pending=False, deadline=None, context=None, prepared=False)
         gap_state.update(generation=gap_state["generation"] + 1, pending=False,
                          deadline=None, preview=None, preparing=False,
                          prepare_deadline=None, prepared=False)
@@ -934,6 +1107,7 @@ def main(argv=None):
         history_skill_resume.configure(state="disabled")
         history_bundle_resume.configure(state="disabled")
         history_batch_button.configure(state="disabled")
+        history_followup_button.configure(state="disabled")
         history_prepare.configure(state="disabled")
         history_gap_cancel.configure(state="disabled")
         history_detail.set(f"{_history_state_label(record.get('state'))} · 正在后台核验成果：{record['root']}")
@@ -942,6 +1116,28 @@ def main(argv=None):
             try:
                 from agent_service.task_history import inspect_task
                 result = inspect_task(record["root"], TASK_ROOT)
+                try:
+                    mail_root = Path(record["root"])
+                    is_mail_record = any((mail_root / name).is_file() for name in (
+                        "mail-analysis-request.json", "mail-analysis-claim.json"))
+                except (OSError, TypeError, ValueError):
+                    is_mail_record = False
+                if is_mail_record:
+                    try:
+                        from agent_service.mail_followup import inspect_followup
+                        result = dict(result)
+                        result["mail_followup"] = inspect_followup(record["root"], TASK_ROOT)
+                    except Exception:
+                        if type(result) is dict:
+                            result = dict(result)
+                            result["mail_followup"] = {
+                                "eligible": False, "code": "mail_followup_inspection_unavailable"}
+                    try:
+                        from agent_service.mail_review_resume import inspect_resume as inspect_mail_review
+                        result = dict(result)
+                        result['mail_review_resume'] = inspect_mail_review(record['root'], TASK_ROOT)
+                    except Exception:
+                        result['mail_review_resume'] = {'eligible': False, 'code': 'mail_review_record_invalid'}
                 history_messages.put(("inspect", (task_id, generation), result))
             except Exception as exc:
                 history_messages.put(("inspect_error", (task_id, generation), type(exc).__name__))
@@ -970,10 +1166,27 @@ def main(argv=None):
         history_use_source.configure(state="normal" if available and historical is not None
                                      and historical[0].suffix.lower() in {".docx", ".xlsx"}
                                      and history_selected["inspection"] is not None else "disabled")
+        task_edit_outputs.configure(state="normal" if available and any(
+            path.suffix.lower() in {'.docx', '.xlsx'} for path in agent_outputs.values())
+            else "disabled")
+        update_mail_understanding_button()
+
+    def update_mail_understanding_button():
+        if mail_understanding_button is None:
+            return
+        source_ref = source_choice["artifact_ref"]
+        source_path = source_ref.get("artifact") if type(source_ref) is dict else ""
+        ready = (active["kind"] is None and not source_choice["pending"]
+                 and source_choice["retry_ref"] is None
+                 and source_choice["mail_export_source"] is True
+                 and source_path.lower().endswith(".docx")
+                 and source_label.get() == source_path)
+        mail_understanding_button.configure(state="normal" if ready else "disabled")
 
     def select_generated_source(origin):
         if active["kind"] is not None or source_choice["pending"]:
             return
+        source_choice["mail_export_source"] = False
         if origin == "current":
             label = agent_output_choice.get()
             path, digest = agent_outputs.get(label), agent_output_hashes.get(label)
@@ -1002,7 +1215,16 @@ def main(argv=None):
             try:
                 from agent_service.artifact_source import prepare_artifact_source
                 ref = prepare_artifact_source(path, digest, TASK_ROOT)
-                source_ref_messages.put(("select", generation, origin, selection, ref, None))
+                is_mail_export = False
+                if Path(ref.get("artifact", "")).suffix.lower() == ".docx":
+                    try:
+                        from agent_service.mail_understanding import load_mail
+                        load_mail(ref, TASK_ROOT)
+                        is_mail_export = True
+                    except Exception:
+                        pass
+                source_ref_messages.put(("select", generation, origin, selection,
+                                         {"reference": ref, "mail_export": is_mail_export}, None))
             except Exception:
                 source_ref_messages.put(("select", generation, origin, selection, None,
                                          "source_artifact_invalid"))
@@ -1046,26 +1268,49 @@ def main(argv=None):
             raise ValueError('goal_handoff_busy')
         choices = {}
         for n, record in enumerate(records, 1):
-            path = _saved_path(record.get('path'), TASK_ROOT, record.get('sha256'))
-            if path is None or path.suffix.lower() not in {'.docx', '.xlsx'}:
+            path = _verified_history_path(record.get('path'), record.get('sha256'), TASK_ROOT)
+            if path is None or path.suffix.lower() not in {'.docx', '.xlsx', '.eml'}:
                 raise ValueError('goal_artifact_changed')
-            label = f"连续任务 {n} · {'Word' if path.suffix.lower() == '.docx' else 'Excel'}"
+            kind = {'.docx': 'Word', '.xlsx': 'Excel', '.eml': '未发送邮件草稿'}[path.suffix.lower()]
+            label = f"连续任务 {n} · {kind}"
             choices[label] = (path, record['sha256'])
         if not choices:
             return
+        # A restored instruction belongs to this exact explicit approval only.
+        # Reuse the existing completion ticket; never clear a newer draft.
+        from agent_service.recovery_instruction import complete
+        binding = recovery_submission['binding']
+        recovery_submission['binding'] = None
+        try:
+            complete(goal_panel, binding, records)
+        except Exception:
+            pass  # Keep drafts if receipt verification cannot finish.
         agent_outputs.clear()
         agent_output_hashes.clear()
         for label, (path, sha) in choices.items():
             agent_outputs[label] = path
             agent_output_hashes[label] = sha
         agent_output_list.configure(values=tuple(choices))
-        last = next(reversed(choices))
+        office_choices = [label for label, (path, _) in choices.items()
+                          if path.suffix.lower() in {'.docx', '.xlsx'}]
+        last = office_choices[-1] if office_choices else next(reversed(choices))
         agent_output_choice.set(last)
         last_paths['agent'] = choices[last][0]
         task_open.configure(state='normal')
         task_dir.configure(state='normal')
-        select_generated_source('current')
+        if office_choices:
+            select_generated_source('current')
+        else:
+            update_source_use_buttons()
+            task_status.set('本地回复草稿已核验，未发送且收件人留空；点击“打开成果”检查内容。')
+        history_before = office_chain_context()['goal'] if office_chain is not None else None
         load_history()
+        if office_chain is not None:
+            # Edit runs carry display metadata; the workspace/chain contract
+            # uses only the already-verified path and hash for every output.
+            office_chain.artifacts_announced(
+                [{'path': str(choices[label][0]), 'sha256': choices[label][1]} for label in office_choices],
+                history_before=history_before)
 
     def accept_resume_artifacts(outputs):
         # Batch/path/hash checks ran in finish_resume's background worker.
@@ -1089,6 +1334,7 @@ def main(argv=None):
         return False
 
     goal_panel.on_artifacts = accept_goal_artifacts
+    windows_panel.on_artifacts = accept_goal_artifacts
     goal_panel.get_artifacts = lambda: [
         {'path': str(path), 'sha256': agent_output_hashes.get(label)}
         for label, path in agent_outputs.items() if path.suffix.lower() in {'.docx', '.xlsx'}]
@@ -1102,6 +1348,25 @@ def main(argv=None):
         tabs.select(goal_panel.tab)
         goal_panel.use_generated_artifacts(records)
 
+    def edit_current_outputs():
+        if (active['kind'] is not None or source_choice['pending'] or goal_panel.running
+                or getattr(goal_panel, 'closed', False)):
+            return
+        records = [{'path': str(path), 'sha256': agent_output_hashes.get(label)}
+                   for label, path in agent_outputs.items()
+                   if path.suffix.lower() in {'.docx', '.xlsx'}]
+        if (not 1 <= len(records) <= 32 or any(
+                not Path(item['path']).is_absolute()
+                or not isinstance(item['sha256'], str)
+                or re.fullmatch(r'[0-9a-f]{64}', item['sha256']) is None for item in records)):
+            task_status.set('当前批次没有完整的可核验 Word/Excel 成果；未查找或替换为其他任务。')
+            return
+        if goal_panel.text.get('1.0', 'end-1c').strip():
+            task_status.set('连续任务页已有指令草稿；请先保存或清空，再接入本批成果。')
+            return
+        tabs.select(goal_panel.tab)
+        goal_panel.use_generated_artifacts(records)
+
     def select_history_artifact_batch():
         if (active['kind'] is not None or source_choice['pending'] or goal_panel.running
                 or history_selected['inspection'] is None):
@@ -1109,8 +1374,8 @@ def main(argv=None):
         records = [{'path': str(path), 'sha256': sha}
                    for path, sha in history_artifacts.values()
                    if path.suffix.lower() in {'.docx', '.xlsx'}]
-        if not 2 <= len(records) <= 4:
-            history_detail.set('整批能力来源需要同一历史任务的 2 至 4 份 Word/Excel 成果；没有截断或混入其他任务。')
+        if not 1 <= len(records) <= 4:
+            history_detail.set('能力模式来源需要同一历史任务的 1 至 4 份 Word/Excel 成果；没有截断或混入其他任务。')
             return
         task_id = history_selected['id']
         selection_generation = history_selected['generation']
@@ -1125,7 +1390,56 @@ def main(argv=None):
         if is_current():
             tabs.select(goal_panel.tab)
             if not goal_panel.use_history_artifact_batch(task_id, records, is_current):
-                history_detail.set('历史批次选择已变化或成果数量不符合要求；请重新检查后选择。')
+                history_detail.set('历史能力来源选择已变化或成果数量不符合要求；请重新检查后选择。')
+
+    def prepare_mail_followup():
+        if (active["kind"] is not None or source_choice["pending"] or goal_panel.running
+                or history_selected["inspection"] is None
+                or mail_followup_state["pending"] or mail_followup_state["prepared"]):
+            return
+        task_id = history_selected["id"]
+        selection_generation = history_selected["generation"]
+        inspection = history_selected["inspection"]
+        record = history_records.get(task_id)
+        followup = inspection.get("mail_followup") if type(inspection) is dict else None
+        if (type(record) is not dict or type(followup) is not dict
+                or followup.get("eligible") is not True
+                or followup.get("task_root") != record.get("root")
+                or not isinstance(followup.get("token"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", followup["token"]) is None):
+            history_candidate_detail.set("邮件原任务当前不可准备；请刷新历史并重新核验。")
+            history_followup_button.configure(state="disabled")
+            return
+        generation = mail_followup_state["generation"] + 1
+        context = {"task_id": task_id, "selection_generation": selection_generation,
+                   "inspection": inspection, "source_generation": source_choice["generation"],
+                   "task_text": task_text.get("1.0", "end-1c"),
+                   "task_root": record["root"], "token": followup["token"]}
+        mail_followup_state.update(generation=generation, pending=True,
+                                   deadline=time.monotonic() + 30, context=context)
+        history_followup_button.configure(state="disabled")
+        history_candidate_detail.set("正在后台重新核验原邮件来源和澄清记录；不会调用模型或修改原任务。")
+
+        def work():
+            try:
+                from agent_service.mail_followup import prepare_followup
+                prepared = prepare_followup(record["root"], TASK_ROOT, followup["token"])
+                history_messages.put(("mail_followup_prepare",
+                                      (task_id, selection_generation, generation), prepared))
+            except Exception as exc:
+                code = str(exc)
+                code = code if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) else type(exc).__name__
+                history_messages.put(("mail_followup_prepare_error",
+                                      (task_id, selection_generation, generation), code))
+
+        try:
+            threading.Thread(target=work, daemon=True,
+                             name="jarvis-mail-followup-prepare").start()
+        except RuntimeError:
+            mail_followup_state.update(generation=generation + 1, pending=False,
+                                       deadline=None, context=None)
+            history_candidate_detail.set("邮件澄清准备未能启动；原任务和现有输入保留。")
+            history_followup_button.configure(state="normal")
 
     ttk.Label(note_tab, text="输入要写入新记事本文档的文字：").pack(anchor="w")
     note_text = tk.Text(note_tab, height=11, wrap="word")
@@ -1149,14 +1463,19 @@ def main(argv=None):
     history_records = {}
     history_artifacts = {}
     history_selected = {"id": None, "generation": 0, "inspection": None}
+    mail_followup_state = {"generation": 0, "pending": False, "deadline": None,
+                           "context": None, "prepared": False}
     history_scan = {"generation": 0}
     gap_state = {"generation": 0, "pending": False, "deadline": None,
                  "preview": None, "preparing": False, "prepare_deadline": None,
                  "prepared": False}
     gap_only = tk.BooleanVar(value=False)
+    history_older = tk.BooleanVar(value=False)
     ttk.Label(history_tab, text="默认显示最近 30 条任务；勾选缺口筛选时读取最近 200 条中的未支持记录。选择后只读核验。",
               wraplength=620).pack(anchor="w", pady=(0, 8))
     ttk.Checkbutton(history_tab, text="仅看未支持任务／能力缺口", variable=gap_only,
+                    command=lambda: load_history()).pack(anchor="w", pady=(0, 5))
+    ttk.Checkbutton(history_tab, text="显示较早任务（最多200条）", variable=history_older,
                     command=lambda: load_history()).pack(anchor="w", pady=(0, 5))
     history_list = ttk.Treeview(history_tab, columns=("state", "kind", "date"), show="headings", height=10)
     history_list.heading("state", text="状态")
@@ -1204,9 +1523,76 @@ def main(argv=None):
     history_batch_row = ttk.Frame(history_tab)
     history_batch_row.pack(fill="x", anchor="w", pady=3)
     history_batch_button = ttk.Button(
-        history_batch_row, text="整批用于能力模式", state="disabled",
+        history_batch_row, text="用于能力模式", state="disabled",
         command=lambda: select_history_artifact_batch())
     history_batch_button.pack(side="left")
+    history_followup_button = ttk.Button(
+        history_batch_row, text="补充邮件要求…", state="disabled",
+        command=lambda: prepare_mail_followup())
+    history_followup_button.pack(side="left", padx=6)
+
+    def mail_review_context():
+        return {'task_root': history_records.get(history_selected['id'], {}).get('root'),
+                'selection_generation': history_selected['generation'],
+                'inspection_id': id(history_selected['inspection']),
+                'source_generation': source_choice['generation'],
+                'draft': task_draft.snapshot(),
+                'busy': active['kind'] is not None or source_choice['pending'] or goal_panel.running}
+
+    def launch_mail_review(prepared):
+        # This request comes from the selected history record, not the main draft.
+        if mail_review_context()['busy']:
+            raise ValueError('mail_review_busy')
+        TASK_ROOT.mkdir(parents=True, exist_ok=True)
+        task_root = TASK_ROOT / ('task-' + uuid.uuid4().hex)
+        task_root.mkdir(exist_ok=False)
+        request = task_root / 'request.txt'
+        with request.open('x', encoding='utf-8', newline='') as stream:
+            stream.write(prepared['instruction'])
+            stream.flush()
+            os.fsync(stream.fileno())
+        command = _task_command(request, task_root, source_artifact=prepared['source_ref'],
+                                mail_understanding=True, mail_review_resume={
+                                    k: prepared[k] for k in ('task_root', 'token')})
+        submitted_instruction.update(task_root=None, ticket=None)
+        last_paths['agent'] = None
+        agent_outputs.clear()
+        agent_output_hashes.clear()
+        agent_output_list.configure(values=())
+        agent_output_choice.set('')
+        task_open.configure(state='disabled')
+        task_dir.configure(state='disabled')
+        task_status.set('正在复用已有邮件候选重新复核；不重新生成，当前新草稿保留。')
+        tabs.select(task_tab)
+        launch('agent', command, task_root=task_root, mail_understanding=True)
+
+    from agent_service.mail_review_panel import MailReviewResumePanel
+    mail_review_panel = MailReviewResumePanel(
+        history_batch_row, ttk=ttk, base=TASK_ROOT, status=history_candidate_detail,
+        get_context=mail_review_context, start=launch_mail_review)
+    def navigate_mail_continuation(link):
+        child = Path(link['child_root'])
+        if (mail_review_context()['busy'] or child.parent != TASK_ROOT
+                or not re.fullmatch(r'task-[0-9a-f]{32}', child.name)
+                or link['parent_root'] != mail_review_context()['task_root']):
+            raise ValueError('mail_navigation_context_changed')
+        task_id = child.name
+        history_records[task_id] = {'id': task_id, 'root': str(child),
+                                   'state': 'needs_review', 'kind': 'office',
+                                   'navigation_parent': link['parent_root']}
+        if task_id not in history_list.get_children():
+            history_list.insert('', 0, iid=task_id,
+                                values=('关联续接 · 待核验', 'office', '由原失败任务直达'))
+        # Tk's selection event uses the ordinary background history verifier.
+        # No second inspection, global list scan, model call or source mutation.
+        history_list.selection_set(task_id)
+        history_list.see(task_id)
+        tabs.select(history_tab)
+
+    from agent_service.mail_review_navigation_panel import MailReviewNavigationPanel
+    mail_navigation_panel = MailReviewNavigationPanel(
+        history_batch_row, ttk=ttk, base=TASK_ROOT, status=history_candidate_detail,
+        get_context=mail_review_context, navigate=navigate_mail_continuation)
     history_prepare = ttk.Button(history_resume_row, text="查看候选／准备新任务", state="disabled",
                                  command=lambda: prepare_from_history())
     history_prepare.pack(side="left", padx=6)
@@ -1218,14 +1604,18 @@ def main(argv=None):
     history_stop.pack(side="left", padx=6)
 
     def launch(kind, command, task_root=None, attempt_id=None, history_id=None,
-               initial_stop=False, resume_kind=None):
+               initial_stop=False, resume_kind=None, mail_understanding=False):
+        mail_review_panel.invalidate()
+        mail_navigation_panel.invalidate()
         notify_goal_external_activity(True, force=True)
         active.update(kind=kind, process=None, stop=initial_stop, task_root=task_root,
                       stop_deadline=time.monotonic() + 3 if initial_stop else None,
                       attempt_id=attempt_id,
                       attempt_root=task_root / (("skill-resume-" if resume_kind == "skill_resume"
                                                 else "resume-") + attempt_id) if attempt_id else None,
-                      history_id=history_id, verify_deadline=None, resume_kind=resume_kind)
+                      history_id=history_id, verify_deadline=None, resume_kind=resume_kind,
+                      mail_understanding=mail_understanding)
+        update_mail_understanding_button()
         note_start.configure(state="disabled")
         research_start.configure(state="disabled")
         task_start.configure(state="disabled")
@@ -1238,6 +1628,7 @@ def main(argv=None):
         history_resume.configure(state="disabled")
         history_skill_resume.configure(state="disabled")
         history_bundle_resume.configure(state="disabled")
+        history_followup_button.configure(state="disabled")
         history_prepare.configure(state="disabled")
         history_stop.configure(state="normal" if kind == "resume" else "disabled")
         options = dict(cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1360,10 +1751,11 @@ def main(argv=None):
             mail_export_messages.put((task_root, None, "mail_export_prepare_failed"))
         return True
 
-    def start_task():
+    def start_task(*, mail_understanding=False):
         if active["kind"]:
             return
         raw_text = task_text.get("1.0", "end-1c")
+        instruction_ticket = task_draft.snapshot()
         if source_choice["retry_changed"]:
             source_choice["retry_changed"] = False
             task_status.set("原任务资料绑定已取消。请核对新请求与资料，再次点击开始；当前未调用模型。")
@@ -1379,6 +1771,15 @@ def main(argv=None):
         if source_choice["pending"]:
             task_status.set("成果来源仍在核验；请等核验完成后再开始任务。")
             return
+        if mail_understanding and (source_choice["mail_export_source"] is not True
+                                   or source_choice["artifact_ref"] is None
+                                   or source_choice["retry_ref"] is not None
+                                   or not source_label.get().lower().endswith(".docx")):
+            task_status.set("请先选用并核验已读邮件的本机 Word；当前未调用模型。")
+            update_mail_understanding_button()
+            return
+        if mail_understanding:
+            mail_understanding_button.configure(state="disabled")
         if source_choice["auto_required"]:
             task_status.set("新成果尚未通过来源核验。请重新点击“用于下一任务”，"
                             "或明确清除/更换来源；当前不会按无来源任务执行。")
@@ -1393,6 +1794,7 @@ def main(argv=None):
             task_root = TASK_ROOT / ("task-" + uuid.uuid4().hex)
             generation = source_choice["generation"]
             original_ref = dict(retry_ref)
+            submitted_instruction.update(task_root=str(task_root), ticket=instruction_ticket)
             history_key = (history_selected["id"], history_selected["generation"])
             notify_goal_external_activity(True, force=True)
             active.update(kind="agent_retry_preparing", process=None, stop=False,
@@ -1429,6 +1831,26 @@ def main(argv=None):
                                          "gap_retry_unavailable"))
             return
         artifact_ref = source_choice["artifact_ref"]
+        if not mail_understanding:
+            # Reuse the reviewed whole-task router for Office sources. An
+            # explicit source stays selected; only an empty selection may
+            # adopt the visible output batch. The entry rechecks its receipts
+            # before routing and retains the existing preview/approval gates.
+            scope = route_scope.get()
+            batch = [path for path in agent_outputs.values()
+                     if path.suffix.lower() in {'.docx', '.xlsx'}]
+            if (scope == '当前选中资料' and artifact_ref is None
+                    and not source_label.get().strip() and batch):
+                if len(batch) > 4:
+                    task_status.set('当前批次超过四份 Word/Excel；请明确选择资料后再规划，未开始任务。')
+                    return
+                route_scope.set('当前成果批次')
+                scope = '当前成果批次'
+            if (scope == '当前成果批次' or scope == '当前选中资料'
+                    and type(artifact_ref) is dict
+                    and Path(source_label.get()).suffix.lower() in {'.docx', '.xlsx'}):
+                office_task_entry.start()
+                return
         if artifact_ref is not None:
             if (type(artifact_ref) is not dict or source_label.get() != artifact_ref.get("artifact")):
                 source_choice["artifact_ref"] = None
@@ -1439,6 +1861,7 @@ def main(argv=None):
             task_root = TASK_ROOT / ("task-" + uuid.uuid4().hex)
             generation = source_choice["generation"]
             original_ref = dict(artifact_ref)
+            submitted_instruction.update(task_root=str(task_root), ticket=instruction_ticket)
             notify_goal_external_activity(True, force=True)
             active.update(kind="agent_source_preparing", process=None, stop=False,
                           task_root=task_root, stop_deadline=None, attempt_id=None,
@@ -1459,10 +1882,10 @@ def main(argv=None):
                     fresh = prepare_artifact_source(original_ref["artifact"],
                                                     original_ref["sha256"], TASK_ROOT)
                     source_ref_messages.put(("start", generation, None,
-                                             (task_root, original_ref, text), fresh, None))
+                                             (task_root, original_ref, text, mail_understanding), fresh, None))
                 except Exception:
                     source_ref_messages.put(("start", generation, None,
-                                             (task_root, original_ref, text), None,
+                                             (task_root, original_ref, text, mail_understanding), None,
                                              "source_artifact_invalid"))
 
             try:
@@ -1470,7 +1893,7 @@ def main(argv=None):
                                  name="jarvis-artifact-source-start").start()
             except RuntimeError:
                 source_ref_messages.put(("start", generation, None,
-                                         (task_root, original_ref, text), None,
+                                         (task_root, original_ref, text, mail_understanding), None,
                                          "source_artifact_unavailable"))
             return
         source_path = None
@@ -1502,6 +1925,7 @@ def main(argv=None):
         task_open.configure(state="disabled")
         task_dir.configure(state="disabled")
         task_status.set("正在理解任务、查找资料并核对结果……")
+        submitted_instruction.update(task_root=str(task_root), ticket=instruction_ticket)
         launch("agent", _task_command(request, task_root, source_path), task_root=task_root)
 
     def stop_research():
@@ -1742,6 +2166,7 @@ def main(argv=None):
         history_detail.set(f"{progress}正在继续 {remaining} 个{label}步骤；本次不调用模型 API。原任务结果保留。")
         launch("resume", command, task_root=task_root, attempt_id=attempt_id,
                history_id=task_id, resume_kind=requested_kind)
+        return attempt_id
 
     def stop_resume():
         if active["kind"] != "resume":
@@ -1794,7 +2219,7 @@ def main(argv=None):
 
     def open_artifact(path, directory=False, status=None):
         if path is None or not path.is_file():
-            return
+            return False
         try:
             if not directory and path.suffix.lower() == ".eml":
                 draft = _read_draft_preview(path)
@@ -1810,10 +2235,17 @@ def main(argv=None):
                 body.pack(fill="both", expand=True, padx=10)
                 ttk.Label(viewer, text="附件：" + ("、".join(draft["attachments"]) or "无"),
                           wraplength=680, padding=10).pack(anchor="w")
-                return
+                return True
+            if not directory and path.suffix.lower() == '.docx':
+                from agent_service.word_open import request_open_word
+                application = request_open_word(path)
+                (status or task_status).set(f'已请求 {application} 打开已核验 Word；没有重新执行任务。')
+                return True
             os.startfile(str(path.parent if directory else path))
+            return True
         except (OSError, ValueError) as exc:
             (status or task_status).set("无法打开：" + str(exc))
+            return False
 
     def open_path(kind, directory=False):
         path = last_paths[kind]
@@ -1826,6 +2258,90 @@ def main(argv=None):
                     task_status.set("成果在核验后已更改或不可用，未打开。")
                     return
         open_artifact(path, directory, note_status if kind == "notepad" else task_status if kind == "agent" else research_status)
+
+    from agent_service.office_task_entry import OfficeTaskEntry
+    route_scope = tk.StringVar(value="当前选中资料")
+
+    def office_route_context():
+        from copy import deepcopy
+        ref = source_choice['artifact_ref']
+        batch = [{'path': str(path), 'sha256': agent_output_hashes.get(label)}
+                 for label, path in agent_outputs.items() if path.suffix.lower() in {'.docx', '.xlsx'}]
+        selected = route_scope.get() == '当前选中资料'
+        records = ([{'path': ref.get('artifact'), 'sha256': ref.get('sha256')}]
+                   if selected and type(ref) is dict else [] if selected else batch)
+        text_widget = getattr(goal_panel, 'text', None)
+        return deepcopy({
+            'instruction': task_text.get('1.0', 'end-1c').strip(),
+            'instruction_revision': task_draft.snapshot()['revision'],
+            'draft': text_widget.get('1.0', 'end-1c') if text_widget is not None else '',
+            'draft_revision': goal_panel.instruction_draft.snapshot()['revision'],
+            'records': records, 'expected_refs': [ref] if selected and type(ref) is dict else None,
+            'unavailable': bool(route_scope.get() not in {'当前选中资料', '当前成果批次'}
+                                or source_choice['pending'] or source_choice['auto_required']
+                                or source_choice['retry_ref'] or source_choice['retry_changed']
+                                or (selected and (type(ref) is not dict
+                                    or source_label.get() != ref.get('artifact')))),
+            'binding': {'scope': route_scope.get(), 'source': source_label.get(),
+                        'generation': source_choice['generation'], 'ref': ref, 'batch': batch}})
+
+    def office_route_busy(value):
+        if value:
+            active.update(kind='office_task_planning')
+            notify_goal_external_activity(True, force=True)
+            # A new explicit planning request can restart after a former stop.
+            # Never clear this flag during background completion/adoption.
+            goal_panel.stopped.clear()
+        elif active['kind'] == 'office_task_planning':
+            active.update(kind=None)
+        task_route_stop.configure(state='normal' if value else 'disabled')
+
+    def office_route_adopt(session, instruction, routed, refs, is_current, source_ticket):
+        accepted = goal_panel.use_task_route(session, instruction, routed, refs, is_current)
+        if accepted:
+            routed_instruction.update(main=source_ticket, goal=goal_panel.instruction_draft.snapshot())
+            tabs.select(goal_panel.tab)
+        return accepted
+
+    def office_route_prepare(session, instruction, routed, refs, is_current):
+        if office_chain_route_binding is None:
+            return False
+        return office_chain_route_binding.prepare(session, instruction, routed, refs, is_current)
+
+    def cancel_office_route():
+        office_task_entry.cancel()
+        if office_chain_route_binding is not None:
+            office_chain_route_binding.cancel()
+
+    def office_route_session():
+        from agent_service.computer import ComputerSession
+        return ComputerSession.create(host=goal_panel.host)
+
+    office_task_entry = OfficeTaskEntry(
+        context=office_route_context, busy=lambda: active['kind'] is not None,
+        on_busy=office_route_busy, prepare=office_route_prepare, status=task_status.set,
+        session_factory=office_route_session, task_base=TASK_ROOT)
+    route_controls = ttk.Frame(task_tab)
+    route_controls.pack(anchor='w', pady=(2, 4))
+    ttk.Button(route_controls, text='按任务规划（云端）', command=office_task_entry.start).pack(side='left')
+    ttk.Combobox(route_controls, textvariable=route_scope,
+                 values=('当前选中资料', '当前成果批次'), width=14, state='readonly').pack(side='left', padx=6)
+    task_route_stop = ttk.Button(route_controls, text='停止规划', command=cancel_office_route, state='disabled')
+    task_route_stop.pack(side='left')
+    ttk.Label(route_controls, text='按完整指令选择能力；编辑自动接入有界范围，可缩小范围并确认差异。',
+              wraplength=260).pack(side='left', padx=6)
+
+    mail_controls = ttk.Frame(task_tab)
+    mail_controls.pack(anchor="w", pady=(2, 4))
+    mail_understanding_button = ttk.Button(
+        mail_controls, text="理解邮件（云端）",
+        command=lambda: start_task(mail_understanding=True), state="disabled")
+    mail_understanding_button.pack(side="left", padx=(0, 8))
+    task_edit_outputs = ttk.Button(mail_controls, text="编辑本批成果…", state="disabled",
+                                   command=edit_current_outputs)
+    task_edit_outputs.pack(side="left", padx=(0, 8))
+    ttk.Label(mail_controls, text="理解邮件会上传所选邮件完整正文作上下文审查；编辑成果先本地选择范围，规划时才上传",
+              wraplength=440, justify="left").pack(side="left", anchor="w")
 
     task_buttons = ttk.Frame(task_tab)
     task_buttons.pack(anchor="w", pady=10)
@@ -1845,6 +2361,244 @@ def main(argv=None):
                                  command=lambda: select_generated_source("current"))
     task_use_source.pack(side="left", padx=6)
     agent_output_list.bind("<<ComboboxSelected>>", lambda _event: update_source_use_buttons())
+
+    from agent_service.workspace_resume import WorkspaceResume
+
+    def workspace_context():
+        from copy import deepcopy
+        ref = source_choice['artifact_ref']
+        records = [{'path': str(path), 'sha256': agent_output_hashes.get(label)}
+                   for label, path in agent_outputs.items()]
+        selected = ({'path': ref.get('artifact'), 'sha256': ref.get('sha256')}
+                    if type(ref) is dict else None)
+        return deepcopy({
+            'payload': {'draft': task_text.get('1.0', 'end-1c'),
+                        'records': records, 'source': selected},
+            'revision': task_draft.snapshot(),
+            'binding': {'source': dict(source_choice), 'label': source_label.get(),
+                        'outputs': list(agent_outputs), 'selected': agent_output_choice.get()},
+            'unavailable': bool(source_choice['pending'] or source_choice['auto_required']
+                                or source_choice['retry_ref'] or source_choice['retry_changed']
+                                or (source_label.get() and (selected is None
+                                    or source_label.get() != selected['path']))
+                                or any(Path(item['path']).suffix.lower() not in {'.docx', '.xlsx'}
+                                       for item in records))})
+
+    def workspace_busy(value):
+        if value:
+            active.update(kind='workspace_restore')
+            notify_goal_external_activity(True, force=True)
+        elif active['kind'] == 'workspace_restore':
+            active.update(kind=None)
+
+    def apply_workspace(verified):
+        # The worker verified the entire batch and selected source together.
+        # No second source worker, model call, approval or task is started here.
+        payload, ref = verified['payload'], verified['source_ref']
+        if active['kind'] is not None or source_choice['pending']:
+            return False
+        agent_outputs.clear()
+        agent_output_hashes.clear()
+        chosen = ''
+        for n, record in enumerate(payload['records'], 1):
+            path = Path(record['path'])
+            label = f"已恢复 {n} · {'Word' if path.suffix.lower() == '.docx' else 'Excel'}"
+            agent_outputs[label] = path
+            agent_output_hashes[label] = record['sha256']
+            if ref and record['path'] == ref['artifact']:
+                chosen = label
+        chosen = chosen or next(reversed(agent_outputs), '')
+        agent_output_list.configure(values=tuple(agent_outputs))
+        agent_output_choice.set(chosen)
+        last_paths['agent'] = agent_outputs.get(chosen)
+        task_open.configure(state='normal' if chosen else 'disabled')
+        task_dir.configure(state='normal' if chosen else 'disabled')
+        source_choice.update(path=ref['artifact'] if ref else '', artifact_ref=ref,
+                             retry_ref=None, retry_instruction=None, retry_changed=False,
+                             mail_export_source=False, auto_required=False, pending=False,
+                             pending_deadline=None, generation=source_choice['generation'] + 1,
+                             setting=True)
+        try:
+            source_label.set(source_choice['path'])
+        finally:
+            source_choice['setting'] = False
+        if task_text.get('1.0', 'end-1c') != payload['draft']:
+            task_text.delete('1.0', 'end')
+            task_text.insert('1.0', payload['draft'])
+        submitted_instruction.update(task_root=None, ticket=None)
+        routed_instruction.update(main=None, goal=None)
+        instruction_state.set('已恢复草稿及办公成果；请检查后明确开始下一任务。')
+        update_source_use_buttons()
+        update_mail_understanding_button()
+        return True
+
+    workspace = WorkspaceResume(
+        context=workspace_context, busy=lambda: active['kind'] is not None,
+        on_busy=workspace_busy, apply=apply_workspace, status=task_status.set,
+        store=ROOT / 'data' / 'assistant_workspace', task_base=TASK_ROOT)
+    workspace_controls = ttk.Frame(task_tab)
+    workspace_controls.pack(anchor='w', pady=(0, 4))
+    ttk.Button(workspace_controls, text='保存当前工作（本机）', command=workspace.save).pack(side='left')
+    ttk.Button(workspace_controls, text='恢复上次工作（本机）', command=workspace.restore).pack(side='left', padx=6)
+
+    from agent_service.office_workspace_panel import OfficeWorkspacePanel
+
+    def office_workspace_busy(value):
+        # This is the goal panel's own read-only preparation. Its regular poll
+        # must not mistake it for an unrelated task and invalidate the input.
+        goal_panel.set_busy(value)
+        if value:
+            active.update(kind='office_workspace_restore')
+            invalidate_mail_followup_pending()
+        elif active['kind'] == 'office_workspace_restore':
+            active.update(kind=None)
+
+    office_workspace_panel = OfficeWorkspacePanel(
+        goal_panel, store=ROOT / 'data' / 'office_workspace', task_base=TASK_ROOT,
+        busy=lambda: active['kind'] is not None, on_busy=office_workspace_busy)
+
+    from agent_service.office_task_chain_panel import OfficeTaskChainPanel
+
+    def office_chain_context():
+        from copy import deepcopy
+        return deepcopy({'workspace': workspace_context(), 'scope': route_scope.get(),
+                         'goal': {'draft': goal_panel.instruction_draft.snapshot(),
+                                  'plan': goal_panel.plan, 'mode': goal_panel.mode.get(),
+                                  'mode_generation': goal_panel.daily_task_route_generation,
+                                  'source_generation': goal_panel.capability_source_generation,
+                                  'office': office_workspace_panel.context()['payload'],
+                                  'stopped': goal_panel.stopped.is_set()}})
+
+    def office_chain_prepare_edit(state):
+        from copy import deepcopy
+        from agent_service.computer import ComputerSession
+        goal_panel.session = ComputerSession(Path(state['run']).parent.parent)
+        ticket = goal_panel.draft_ticket()
+        if not goal_panel.show_plan(deepcopy(state['edit_plan']), instruction_ticket=ticket):
+            return False
+        routed_instruction.update(main=task_draft.snapshot(), goal=goal_panel.instruction_draft.snapshot())
+        tabs.select(goal_panel.tab)
+        return True
+
+    def office_chain_busy(value):
+        goal_panel.set_busy(value)
+        if value:
+            active.update(kind='office_task_chain')
+        elif active['kind'] == 'office_task_chain':
+            active.update(kind=None)
+
+    def office_chain_status(message):
+        task_status.set(message)
+        goal_panel.status.set(message)
+
+    def office_chain_start_resume(state):
+        # This preview came from the chain worker's exact task/proof checks.
+        # The existing child process rechecks the token before any Office work.
+        if active['kind'] is not None or source_choice['pending'] or goal_panel.running:
+            return None
+        task_root = Path(state['task_root'])
+        preview = state['resume_preview']
+        resume_kind = preview.get('kind')
+        if (type(resume_kind) is not str or resume_kind not in {'office_resume', 'bundle_resume'}
+                or task_root.parent != TASK_ROOT or preview.get('task_root') != str(task_root)
+                or preview.get('eligible') is not True or preview.get('remaining', 0) < 1):
+            return None
+        task_id = task_root.name
+        original_state = state.get('resume_original_state', 'unknown')
+        history_records[task_id] = {'root': str(task_root), 'state': original_state}
+        history_selected.update(id=task_id, inspection={
+            'root': str(task_root), 'original_state': original_state, 'resume': preview})
+        # No global history scan or user file selection is needed for this task.
+        if not history_list.exists(task_id):
+            history_list.insert('', 0, iid=task_id, values=('清单剩余步骤', task_id))
+        history_list.selection_set(task_id)
+        tabs.select(history_tab)
+        return start_resume(resume_kind=resume_kind)
+
+    def office_chain_clear_resume_goal(ticket):
+        tracker = goal_panel.instruction_draft
+        if (goal_panel.plan is not None or not tracker.unchanged(ticket)
+                or (ticket['text'].strip() and not tracker.complete(ticket))):
+            return False
+        routed_instruction.update(main=None, goal=None)
+        tabs.select(task_tab)
+        return True
+
+    def office_chain_open_draft(record):
+        path = _verified_history_path(record.get('path'), record.get('sha256'), TASK_ROOT)
+        if path is None or path.suffix.lower() != '.eml':
+            office_chain_status('草稿在核验后已变化或不可用，未打开。')
+            return False
+        return open_artifact(path, status=task_status) is True
+
+    def office_chain_open_result(record):
+        path = _verified_history_path(record.get('path'), record.get('sha256'), TASK_ROOT)
+        if path is None or path.suffix.lower() not in {'.docx', '.xlsx', '.eml'}:
+            office_chain_status('成果在核验后已变化或不可用，未打开。')
+            return False
+        return open_artifact(path, status=task_status) is True
+
+    office_chain = OfficeTaskChainPanel(
+        root=root, context=office_chain_context,
+        busy=lambda: active['kind'] is not None or source_choice['pending'] or goal_panel.running,
+        on_busy=office_chain_busy, apply=apply_workspace, prepare=office_route_prepare,
+        set_scope=route_scope.set, status=office_chain_status,
+        store=ROOT/'data'/'office_task_chains', task_base=TASK_ROOT,
+        computer_base=ROOT/'data'/'computer_sessions',
+        office_context=office_workspace_panel.context, apply_office=office_workspace_panel.apply,
+        prepare_edit=office_chain_prepare_edit, start_resume=office_chain_start_resume,
+        clear_resume_goal=office_chain_clear_resume_goal, open_draft=office_chain_open_draft)
+    goal_panel.before_show_plan = office_chain.before_plan
+    from agent_service.office_chain_plan_binding import OfficeChainPlanBinding
+    office_chain_plan_binding = OfficeChainPlanBinding(goal_panel, office_chain)
+    from agent_service.office_chain_route_binding import OfficeChainRouteBinding
+    office_chain_route_binding = OfficeChainRouteBinding(
+        goal_panel, office_chain, adopt=office_route_adopt, source_ticket=task_draft.snapshot,
+        set_waiting=lambda value: task_route_stop.configure(state='normal' if value else 'disabled'))
+    ttk.Button(workspace_controls, text='任务清单（2–4步）…', command=office_chain.new_dialog).pack(side='left', padx=4)
+    ttk.Button(workspace_controls, text='找回任务清单…', command=office_chain.history_dialog).pack(side='left')
+    ttk.Button(workspace_controls, text='停止接续', command=office_chain.cancel).pack(side='left', padx=4)
+    from agent_service.office_chain_delivery import OfficeChainDelivery
+    chain_delivery = OfficeChainDelivery(office_chain, open_result=office_chain_open_result)
+    ttk.Button(workspace_controls, text='查看清单成果', command=chain_delivery.show).pack(side='left')
+    ttk.Button(workspace_controls, text='重新核验', command=office_chain.retry_verification).pack(side='left', padx=(4, 0))
+
+    from agent_service.mixed_tasks_panel import MixedTasksPanel
+
+    def mixed_context():
+        context = office_route_context()
+        if (not source_label.get() and source_choice['artifact_ref'] is None
+                and 1 <= len(context['binding']['batch']) <= 4
+                and not source_choice['pending'] and not source_choice['auto_required']):
+            route_scope.set('当前成果批次')
+            context = office_route_context()
+        return context
+
+    def mixed_busy(value):
+        if value:
+            active.update(kind='mixed_task')
+            notify_goal_external_activity(True, force=True)
+        elif active['kind'] == 'mixed_task':
+            active.update(kind=None)
+
+    def mixed_apply(verified):
+        if not apply_workspace(verified):
+            return False
+        route_scope.set('当前成果批次')
+        tabs.select(task_tab)
+        task_status.set('混合清单成果已核验并接入下一任务；无需重新找文件。')
+        return True
+
+    mixed_panel = MixedTasksPanel(
+        root=root, context=mixed_context, workspace_context=workspace_context,
+        windows=lambda: windows_panel.approved_observations,
+        busy=lambda: active['kind'] is not None or source_choice['pending'] or goal_panel.running,
+        on_busy=mixed_busy, apply=mixed_apply, status=task_status.set, task_base=TASK_ROOT)
+    mixed_controls = ttk.Frame(task_tab)
+    mixed_controls.pack(anchor='w', pady=(0, 4))
+    ttk.Button(mixed_controls, text='拆分混合任务（云端）…', command=mixed_panel.new).pack(side='left')
+    ttk.Button(mixed_controls, text='找回混合任务…', command=mixed_panel.restore).pack(side='left', padx=6)
+    ttk.Label(mixed_controls, text='Office＋Windows：自然语言拆分，逐步审阅，只续未完成步骤。').pack(side='left')
 
     note_buttons = ttk.Frame(note_tab)
     note_buttons.pack(anchor="w", pady=10)
@@ -1874,7 +2628,10 @@ def main(argv=None):
             history_skill_resume.configure(state="disabled")
             history_bundle_resume.configure(state="disabled")
             history_prepare.configure(state="disabled")
+            history_followup_button.configure(state="disabled")
             history_candidate_detail.set("")
+            mail_review_panel.invalidate()
+            mail_navigation_panel.invalidate()
             return False
         history_selected["inspection"] = result
         history_artifacts.clear()
@@ -1898,9 +2655,24 @@ def main(argv=None):
         office_records = [(path, sha) for path, sha in history_artifacts.values()
                           if path.suffix.lower() in {".docx", ".xlsx"}]
         history_batch_button.configure(
-            state="normal" if 2 <= len(office_records) <= 4
+            state="normal" if 1 <= len(office_records) <= 4
             and active["kind"] is None else "disabled")
+        mail_followup = result.get("mail_followup")
+        followup_ready = (type(mail_followup) is dict
+                          and mail_followup.get("eligible") is True
+                          and mail_followup.get("task_root") == result.get("root")
+                          and isinstance(mail_followup.get("token"), str)
+                          and re.fullmatch(r"[0-9a-f]{64}", mail_followup["token"]) is not None
+                          and bool(_clean_mail_followup_question(mail_followup.get("question"))))
+        history_followup_button.configure(
+            state="normal" if followup_ready and active["kind"] is None else "disabled")
+        review_ready = mail_review_panel.update(result)
+        mail_navigation_panel.update(result)
+        review_claimed = (type(result.get('mail_review_resume')) is dict
+                          and result['mail_review_resume'].get('code') == 'mail_review_resume_already_claimed')
         original = result.get("original_state", result.get("state"))
+        if review_ready or review_claimed:
+            original = 'failed'  # The strict review preview verified this terminal parent state.
         summary = f"原任务：{_original_state_label(original)} · 已核验成果 {len(labels)} 个"
         continuation = result.get("continuation")
         if type(continuation) is dict:
@@ -1925,15 +2697,47 @@ def main(argv=None):
                         f"{'个技能' if skill_eligible else '个联合核对' if bundle_eligible else '个办公'}步骤；无需模型 API")
         elif original == "succeeded" and result.get("state") == "succeeded":
             summary += " · 已完成；可将成果用于下一任务"
-        elif type(preview) is dict and result.get("kind") == "office":
+        elif (not followup_ready and not review_ready and not review_claimed and type(preview) is dict
+              and result.get("kind") == "office"):
             summary += " · " + _resume_reason_label(preview.get("reason"))
             if (preview.get("kind") != "skill_resume"
+                    and preview.get('reason') != 'mail_analysis_binding_invalid'
                     and type(result.get("input_failure")) is not dict
                     and type(result.get("capability_gap")) is not dict):
                 summary += "；若属技能任务，需重新核对候选并新建任务，不直接续跑"
         gap = result.get("capability_gap")
         failure = result.get("input_failure")
-        if result.get("state") == "unsupported" and type(gap) is dict:
+        if review_ready:
+            from agent_service.mail_review_resume import describe as describe_mail_review
+            detail = describe_mail_review(result['mail_review_resume'])
+            original_text = _clean_mail_followup_question(result['mail_review_resume']['instruction'])
+            history_candidate_detail.set(detail + '\n原指令：' + original_text)
+            summary += ' · 已有候选和计划；可显式复核续接，不重复生成'
+        elif review_claimed:
+            from agent_service.mail_review_resume import describe as describe_mail_review
+            history_candidate_detail.set(describe_mail_review(result['mail_review_resume']))
+            summary += ' · 已创建一次复核续接，请查看新任务；原失败保留'
+        elif followup_ready:
+            question = _clean_mail_followup_question(mail_followup.get("question"))
+            code = mail_followup.get("code")
+            state_label = ("审查未通过" if code == "mail_followup_review_rejected"
+                           else "待补充要求" if code == "mail_followup_needs_input"
+                           else "待核验")
+            history_candidate_detail.set(
+                "邮件分析阶段已停止，历史记录没有可续跑的 Office 步骤。"
+                f"模型提示：{question.rstrip('。！？.!?')}。"
+                "请补全完整任务后准备新尝试；原任务保留。")
+            summary += f" · 邮件分析阶段停止（{state_label}）；不能续跑原任务，可准备新的完整任务尝试"
+        elif (type(mail_followup) is dict
+              and mail_followup.get("code") != "mail_followup_not_mail"):
+            try:
+                from agent_service.mail_followup import describe
+                followup_reason = describe(mail_followup)
+            except Exception:
+                followup_reason = "邮件分析澄清记录未通过核验，不能准备新尝试。"
+            if isinstance(followup_reason, str) and followup_reason:
+                history_candidate_detail.set(followup_reason + " 原任务和成果均保留。")
+        elif result.get("state") == "unsupported" and type(gap) is dict:
             candidates = gap.get("candidates")
             shown = []
             if type(candidates) is list:
@@ -1958,6 +2762,10 @@ def main(argv=None):
         history_prepare.configure(state="normal" if active["kind"] is None and (
             result.get("state") == "unsupported" and type(gap) is dict
             or result.get("state") == "failed" and type(failure) is dict) else "disabled")
+        if history_records.get(history_selected['id'], {}).get('navigation_parent'):
+            summary = '已直达关联续接任务 · ' + summary
+            if result.get('state') == 'succeeded' and labels:
+                history_candidate_detail.set('已有成果已核验，可直接打开、用于下一任务或继续编辑；没有重新执行。')
         history_detail.set(summary + f" · {result['root']}")
         if result.get("state") == "unsupported" and type(gap) is dict:
             request_gap_preview()
@@ -2014,6 +2822,12 @@ def main(argv=None):
             history_messages.put(("mail_export_final_error", str(task_root), None))
 
     def poll_once():
+        mail_review_panel.poll()
+        mail_navigation_panel.poll()
+        office_workspace_panel.poll()
+        workspace.poll()
+        office_task_entry.poll()
+        office_chain.poll()
         if time.monotonic() - budget_clock["updated"] >= 5:
             refresh_budget()
         try:
@@ -2046,6 +2860,7 @@ def main(argv=None):
                     active.update(kind=None, process=None, stop=False, task_root=None,
                                   stop_deadline=None, attempt_id=None, attempt_root=None,
                                   history_id=None, verify_deadline=None)
+                    update_mail_understanding_button()
                     note_start.configure(state="normal")
                     research_start.configure(state="normal")
                     task_start.configure(state="normal")
@@ -2091,6 +2906,11 @@ def main(argv=None):
                         continue
                     source_choice["pending"] = False
                     source_choice["pending_deadline"] = None
+                    is_mail_export = False
+                    if (type(ref) is dict and set(ref) == {"reference", "mail_export"}
+                            and type(ref["mail_export"]) is bool):
+                        is_mail_export = ref["mail_export"]
+                        ref = ref["reference"]
                     if origin == "current":
                         label = agent_output_choice.get()
                         current = (label, str(agent_outputs.get(label)),
@@ -2109,8 +2929,10 @@ def main(argv=None):
                     if (error is not None or type(ref) is not dict
                             or ref.get("artifact") != expected_path
                             or ref.get("sha256") != expected_sha):
+                        source_choice["mail_export_source"] = False
                         task_status.set("新成果或办公回执无法核验；未带入该成果。"
                                         "请重新核验，或明确清除来源后再开始新任务。尚未调用模型。")
+                        update_mail_understanding_button()
                         continue
                     source_choice["setting"] = True
                     try:
@@ -2119,18 +2941,20 @@ def main(argv=None):
                         source_choice["setting"] = False
                     source_choice["path"] = ref["artifact"]
                     source_choice["artifact_ref"] = dict(ref)
+                    source_choice["mail_export_source"] = is_mail_export
                     source_choice["auto_required"] = False
                     source_choice["retry_ref"] = None
                     source_choice["retry_instruction"] = None
                     source_choice["retry_changed"] = False
                     source_clear.configure(state="normal")
+                    update_mail_understanding_button()
                     draft_note = ("本批邮件草稿仅保存在本机，未发送。"
                                   if origin == "current" and any(
                                       p.suffix.lower() == ".eml" for p in agent_outputs.values()) else "")
                     task_status.set(draft_note + "已选经核验的 Word/Excel 成果。填写新任务后点击开始；"
                                     "届时文件内容会提供给云端模型，下一任务尚未启动。")
                 elif event == "start":
-                    task_root, original_ref, task_instruction = selection
+                    task_root, original_ref, task_instruction, mail_understanding = selection
                     if (active["kind"] != "agent_source_preparing"
                             or active.get("task_root") != task_root
                             or generation != source_choice["generation"]):
@@ -2139,6 +2963,7 @@ def main(argv=None):
                     active.update(kind=None, process=None, stop=False, task_root=None,
                                   stop_deadline=None, attempt_id=None, attempt_root=None,
                                   history_id=None, verify_deadline=None)
+                    update_mail_understanding_button()
                     note_start.configure(state="normal")
                     research_start.configure(state="normal")
                     task_start.configure(state="normal")
@@ -2152,11 +2977,15 @@ def main(argv=None):
                     if (error is not None or ref != original_ref
                             or source_choice["artifact_ref"] != original_ref
                             or source_label.get() != original_ref.get("artifact")
+                            or submitted_instruction['task_root'] != str(task_root)
+                            or not task_draft.unchanged(submitted_instruction['ticket'])
                             or task_text.get("1.0", "end-1c").strip() != task_instruction):
                         task_status.set("任务内容、成果或办公回执在开始前已变化；未调用模型，请重新选用成果。")
                         source_choice["artifact_ref"] = None
                         source_choice["auto_required"] = True
+                        source_choice["mail_export_source"] = False
                         source_clear.configure(state="normal")
+                        update_mail_understanding_button()
                         continue
                     try:
                         from agent_service.artifact_source import prepare_artifact_task_root
@@ -2168,6 +2997,7 @@ def main(argv=None):
                             os.fsync(file.fileno())
                     except (OSError, ValueError):
                         task_status.set("无法准备任务记录；尚未调用模型。")
+                        update_mail_understanding_button()
                         continue
                     last_paths["agent"] = None
                     agent_outputs.clear()
@@ -2176,9 +3006,13 @@ def main(argv=None):
                     agent_output_choice.set("")
                     task_open.configure(state="disabled")
                     task_dir.configure(state="disabled")
-                    task_status.set("成果已复核，正在为新任务建立来源快照；之后才会按 ¥5 每日预算调用模型。")
-                    launch("agent", _task_command(request, task_root, source_artifact=original_ref),
-                           task_root=task_root)
+                    task_status.set(
+                        "已读邮件内容将提供给云端模型，正在建立来源快照；之后按当前本地费用设置调用模型。"
+                        if mail_understanding else
+                        "成果已复核，正在为新任务建立来源快照；之后才会按当前本地费用设置调用模型。")
+                    launch("agent", _task_command(request, task_root, source_artifact=original_ref,
+                                                   mail_understanding=mail_understanding),
+                           task_root=task_root, mail_understanding=mail_understanding)
                 elif event == "retry_start":
                     task_root, original_ref, task_instruction, history_key = selection
                     if (active["kind"] != "agent_retry_preparing"
@@ -2207,6 +3041,8 @@ def main(argv=None):
                             or history_key != (history_selected["id"],
                                                history_selected["generation"])
                             or source_choice["retry_ref"] != original_ref
+                            or submitted_instruction['task_root'] != str(task_root)
+                            or not task_draft.unchanged(submitted_instruction['ticket'])
                             or source_label.get() not in {RETRY_SOURCE_LABEL,
                                                           RETRY_NO_SOURCE_LABEL}
                             or task_text.get("1.0", "end-1c") != task_instruction):
@@ -2232,7 +3068,7 @@ def main(argv=None):
                     agent_output_choice.set("")
                     task_open.configure(state="disabled")
                     task_dir.configure(state="disabled")
-                    task_status.set("新任务正在重新核验原来源；通过后才按每日 ¥5 预算调用模型。"
+                    task_status.set("新任务正在重新核验原来源；通过后才按当前本地费用设置调用模型。"
                                     "旧未支持任务保持不变。")
                     launch("agent", command, task_root=task_root)
         except queue.Empty:
@@ -2309,8 +3145,103 @@ def main(argv=None):
                     history_skill_resume.configure(state="disabled")
                     history_bundle_resume.configure(state="disabled")
                     history_prepare.configure(state="disabled")
+                    history_followup_button.configure(state="disabled")
                     history_candidate_detail.set("")
                     history_detail.set(f"待核验 · 后台核验未完成（{data}）；未执行任务。")
+                elif event in {"mail_followup_prepare", "mail_followup_prepare_error"}:
+                    context = mail_followup_state.get("context")
+                    expected_key = ((context or {}).get("task_id"),
+                                    (context or {}).get("selection_generation"),
+                                    mail_followup_state["generation"])
+                    if (not mail_followup_state["pending"] or context is None
+                            or task_id != expected_key):
+                        continue
+                    mail_followup_state.update(pending=False, deadline=None, context=None)
+                    record = history_records.get(history_selected["id"])
+                    current = (history_selected["id"] == context["task_id"]
+                               and history_selected["generation"] == context["selection_generation"]
+                               and history_selected["inspection"] is context["inspection"]
+                               and source_choice["generation"] == context["source_generation"]
+                               and task_text.get("1.0", "end-1c") == context["task_text"]
+                               and active["kind"] is None and not source_choice["pending"]
+                               and not goal_panel.running
+                               and type(record) is dict and record.get("root") == context["task_root"])
+                    if not current:
+                        history_candidate_detail.set(
+                            "历史选择、资料来源、任务框或运行状态已变化；旧准备结果已忽略，当前内容保留。")
+                        still_same_history = (
+                            history_selected["id"] == context["task_id"]
+                            and history_selected["generation"] == context["selection_generation"]
+                            and history_selected["inspection"] is context["inspection"])
+                        history_followup_button.configure(
+                            state="normal" if still_same_history
+                            and source_choice["generation"] == context["source_generation"]
+                            and active["kind"] is None and not source_choice["pending"]
+                            and not goal_panel.running
+                            else "disabled")
+                        continue
+                    if event == "mail_followup_prepare_error":
+                        code = data if isinstance(data, str) else "mail_followup_prepare_failed"
+                        try:
+                            from agent_service.mail_followup import describe
+                            reason = describe({"eligible": False, "code": code})
+                        except Exception:
+                            reason = "邮件原任务重新核验未通过。"
+                        history_candidate_detail.set(
+                            f"{reason} 原请求与现有输入保留，请刷新历史后重新核验。")
+                        history_followup_button.configure(
+                            state="normal" if not mail_followup_state["prepared"] else "disabled")
+                        continue
+                    prepared = data
+                    source_ref = prepared.get("source_ref") if type(prepared) is dict else None
+                    instruction = prepared.get("instruction") if type(prepared) is dict else None
+                    question = _clean_mail_followup_question(
+                        prepared.get("question") if type(prepared) is dict else None)
+                    valid = (type(prepared) is dict
+                             and prepared.get("task_root") == context["task_root"]
+                             and prepared.get("token") == context["token"]
+                             and type(source_ref) is dict
+                             and isinstance(source_ref.get("artifact"), str)
+                             and source_ref["artifact"].lower().endswith(".docx")
+                             and isinstance(source_ref.get("sha256"), str)
+                             and re.fullmatch(r"[0-9a-f]{64}", source_ref["sha256"]) is not None
+                             and isinstance(instruction, str) and 1 <= len(instruction) <= 4000
+                             and bool(question))
+                    if not valid:
+                        history_candidate_detail.set(
+                            "邮件澄清准备回执无效或来源已变化；没有带入资料或覆盖任务框。请重新核验历史。")
+                        history_followup_button.configure(state="disabled")
+                        continue
+                    current_text = task_text.get("1.0", "end-1c")
+                    if current_text != "" and current_text != instruction:
+                        history_candidate_detail.set(
+                            "任务框已有不同的非空草稿；请先自行保存或清空，再重新准备。现有内容未覆盖。")
+                        history_followup_button.configure(state="normal")
+                        continue
+                    if current_text == "":
+                        task_text.delete("1.0", "end")
+                        task_text.insert("1.0", instruction)
+                    source_choice.update(artifact_ref=dict(source_ref), retry_ref=None,
+                                         retry_instruction=None, retry_changed=False,
+                                         auto_required=False, mail_export_source=True,
+                                         generation=source_choice["generation"] + 1,
+                                         pending=False, pending_deadline=None,
+                                         path=source_ref["artifact"])
+                    source_choice["setting"] = True
+                    try:
+                        source_label.set(source_ref["artifact"])
+                    finally:
+                        source_choice["setting"] = False
+                    source_clear.configure(state="normal")
+                    mail_followup_state["prepared"] = True
+                    history_followup_button.configure(state="disabled")
+                    update_mail_understanding_button()
+                    tabs.select(task_tab)
+                    task_status.set(
+                        "原邮件请求与已核验来源已恢复；澄清问题仅作提示。请补全完整任务后明确点击“理解邮件（云端）”；不会自动运行。问题："
+                        + question)
+                    history_candidate_detail.set(
+                        "已恢复原请求和同一已核验邮件来源。请补全完整要求并在任务页明确点击“理解邮件（云端）”；原历史记录保留。")
                 elif event in {"gap_preview", "gap_preview_error"}:
                     if task_id != (history_selected["id"], history_selected["generation"],
                                    gap_state["generation"]) or not gap_state["pending"]:
@@ -2381,6 +3312,13 @@ def main(argv=None):
                     source_entry.configure(state="normal")
                     source_clear.configure(state="normal" if source_choice["path"] else "disabled")
                     history_stop.configure(state="disabled")
+                    # A chain consumes its fixed attempt before generic history
+                    # handoff; its worker revalidates all durable evidence.
+                    if office_chain.resume_finished(
+                            TASK_ROOT / selected_id, attempt_id,
+                            stopped=(event == 'resume_final_error' or data.get('stopped')
+                                     or data.get('timed_out'))):
+                        continue
                     if event == "resume_final_error":
                         history_resume.configure(state="disabled")
                         history_skill_resume.configure(state="disabled")
@@ -2519,7 +3457,10 @@ def main(argv=None):
                     else:
                         history_messages.put(("mail_export_final_error", "", None))
                     continue
-                active.update(kind=None, process=None, stop=False, task_root=None)
+                mail_understanding_mode = active.get("mail_understanding") is True
+                active.update(kind=None, process=None, stop=False, task_root=None,
+                              mail_understanding=False)
+                update_mail_understanding_button()
                 note_start.configure(state="normal")
                 research_start.configure(state="normal")
                 task_start.configure(state="normal")
@@ -2555,6 +3496,8 @@ def main(argv=None):
                         try:
                             outcome = _record_desktop_outcome(note_parent["root"], result, returncode=returncode)
                             task_status.set("记事本已保存并回读。" if outcome["ok"] else "记事本任务未确认完成，执行记录已保留。")
+                            if outcome['ok'] is True and not stopped and not timed_out and returncode == 0:
+                                complete_submitted_instruction(note_parent['root'])
                         except (OSError, ValueError):
                             task_status.set("记事本结果见记事本页；上层任务记录未能落盘。")
                         if path:
@@ -2607,20 +3550,37 @@ def main(argv=None):
                             completed = result.get("completed")
                             done_count = len(completed) if isinstance(completed, list) else 0
                             if result.get("ok") is True and result.get("state") == "succeeded":
-                                task_status.set(f"已核验 {len(office_outputs)} 个文件；完成步骤 {done_count} 个。邮件草稿均未发送。" if any(path.suffix.lower() == ".eml" for _, path in office_outputs)
+                                task_status.set(_mail_understanding_success_label(office_outputs, done_count) if mail_understanding_mode else
+                                                f"已核验 {len(office_outputs)} 个文件；完成步骤 {done_count} 个。邮件草稿均未发送。" if any(path.suffix.lower() == ".eml" for _, path in office_outputs)
                                                 else f"办公工作流已核验 {len(office_outputs)} 个文件；完成步骤 {done_count} 个。选择文件后可打开。")
                             else:
-                                reason = result.get("error") or result.get("state") or "未知状态"
+                                mail_result = dict(result)
+                                if stopped:
+                                    mail_result["error"] = "task_cancelled"
+                                elif timed_out:
+                                    mail_result["error"] = "task_deadline"
+                                reason = (_mail_understanding_error_label(mail_result)
+                                          if mail_understanding_mode else
+                                          result.get("error") or result.get("state") or "未知状态")
                                 if reason in {"office_ui_blocked", "office_ui_unavailable"}:
                                     reason = _resume_reason_label(reason)
                                 task_status.set(f"部分完成：已核验 {len(office_outputs)} 个文件，后续步骤未完成（{reason}）。已有成果可以打开。")
                         else:
-                            reason = "已停止" if stopped else "超时" if timed_out else result.get("error") or result.get("state") or "没有核验文件"
+                            mail_result = dict(result)
+                            if stopped:
+                                mail_result["error"] = "task_cancelled"
+                            elif timed_out:
+                                mail_result["error"] = "task_deadline"
+                            reason = (_mail_understanding_error_label(mail_result)
+                                      if mail_understanding_mode else
+                                      "已停止" if stopped else "超时" if timed_out else result.get("error") or result.get("state") or "没有核验文件")
                             if reason in {"office_ui_blocked", "office_ui_unavailable"}:
                                 reason = _resume_reason_label(reason)
-                            task_status.set(f"Office 任务未完成：{reason}。任务记录：{task_root}")
+                            task_status.set((f"{reason} 任务记录：{task_root}" if mail_understanding_mode else
+                                             f"Office 任务未完成：{reason}。任务记录：{task_root}"))
                         if (result.get("ok") is True and result.get("state") == "succeeded"
-                                and office_outputs and not stopped and not timed_out):
+                                and office_outputs and not stopped and not timed_out and returncode == 0):
+                            complete_submitted_instruction(task_root)
                             stage_next_office_source()
                         if was_skill:
                             skill_status.set("本地技能成果已保存并核验；不调用模型。"
@@ -2648,6 +3608,8 @@ def main(argv=None):
                         task_open.configure(state="normal")
                         task_dir.configure(state="normal")
                         task_status.set("带来源的归纳文档已保存并回读：" + str(path))
+                        if not stopped and not timed_out and returncode == 0:
+                            complete_submitted_instruction(task_root)
                     else:
                         reason = "已停止" if stopped else "超时" if timed_out else result.get("error") or result.get("reason") or result.get("state") or "无有效结果"
                         task_status.set(f"任务未完成：{reason}。任务记录：{task_root}")
@@ -2679,6 +3641,13 @@ def main(argv=None):
             source_choice["pending_deadline"] = None
             source_choice["generation"] += 1
             task_status.set("成果来源核验超时；请重新选择。尚未调用模型。")
+        if (mail_followup_state["pending"] and mail_followup_state["deadline"] is not None
+                and time.monotonic() >= mail_followup_state["deadline"]):
+            mail_followup_state.update(generation=mail_followup_state["generation"] + 1,
+                                       pending=False, deadline=None, context=None)
+            history_candidate_detail.set(
+                "邮件澄清重新核验超时；原记录和当前草稿保留，迟到结果会忽略。请重新选择历史记录。")
+            history_followup_button.configure(state="disabled")
         if (gap_state["pending"] and gap_state["deadline"] is not None
                 and time.monotonic() >= gap_state["deadline"]):
             gap_state.update(generation=gap_state["generation"] + 1, pending=False,
@@ -2758,11 +3727,30 @@ def main(argv=None):
             root.after(100, poll)
 
     def close():
-        if active['kind'] == 'computer_goal':
+        mail_navigation_panel.invalidate()
+        if active['kind'] == 'mixed_task':
+            mixed_panel.close()
+            root.after(200, close)
+        elif active['kind'] == 'office_task_chain':
+            office_chain.close()
+            root.after(200, close)
+        elif active['kind'] == 'office_workspace_restore':
+            office_workspace_panel.close()
+            root.after(200, close)
+        elif active['kind'] == 'workspace_restore':
+            workspace.close()
+            root.after(200, close)
+        elif active['kind'] == 'office_task_planning':
+            office_task_entry.close()
+            root.after(200, close)
+        elif active['kind'] == 'computer_goal':
             goal_panel.stop()
             root.after(200, close)
         elif active['kind'] == 'computer':
             computer_panel.stop()
+            root.after(200, close)
+        elif active['kind'] == 'windows_task':
+            windows_panel.stop()
             root.after(200, close)
         elif active["kind"] in {"research", "agent", "agent_source_preparing",
                               "agent_retry_preparing",
@@ -2782,7 +3770,15 @@ def main(argv=None):
         elif active["kind"] == "notepad":
             note_status.set("请先在记事本执行窗口完成或停止任务。")
         else:
+            mixed_panel.close()
+            office_chain.close()
+            office_workspace_panel.close()
+            workspace.close()
+            office_task_entry.close()
+            mail_followup_state.update(generation=mail_followup_state["generation"] + 1,
+                                       pending=False, deadline=None, context=None)
             computer_panel.close()
+            windows_panel.close()
             goal_panel.close()
             root.destroy()
 

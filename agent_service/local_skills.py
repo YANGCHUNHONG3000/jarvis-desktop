@@ -25,7 +25,7 @@ _ID = re.compile(r"[a-z][a-z0-9-]{2,47}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _CODE = ("local_skills.py", "office.py", "office_host.py", "office_workflow.py", "office_readiness.py",
          "office_source.py", "office_source_plan.py", "artifact_source.py",
-         "task_history.py", "email_draft.py", "mail_export.py", "office_resume.py",
+         "task_history.py", "email_draft.py", "mail_export.py", "mail_understanding.py", "mail_review_resume.py", "office_resume.py",
          "office_bundle.py", "office_bundle_resume.py", "capability_source_choice.py", "office_handoff.py",
          "assistant.py", "skill_matching.py", "skill_resume.py", "gap_recovery.py",
          "adapter_development.py",

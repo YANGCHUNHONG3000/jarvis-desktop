@@ -1,5 +1,6 @@
 """Thin UI for the reviewed copied-Office editing profile."""
 import re
+from copy import deepcopy
 from . import office_edit_adapter as adapter
 
 
@@ -21,11 +22,60 @@ def uses_adapter(session, plan):
     return is_edit_plan(plan)
 
 
+def capture_instruction(parent, session, plan, ticket):
+    """UI-thread draft identity for this exact approved edit and its continuations."""
+    from .computer import digest
+    tracker = getattr(parent, 'instruction_draft', None)
+    if tracker is None or not is_edit_plan(plan):
+        return ticket
+    session_root = getattr(session, 'root', None)
+    if 'recovery' in plan:
+        binding = getattr(parent, '_office_edit_instruction', None)
+        if (session_root is not None and binding is not None
+                and binding['session_root'] == str(session_root)
+                and digest(binding['plan']) == digest(plan)
+                and tracker.unchanged(binding['ticket'])):
+            return dict(binding['ticket'])
+        return None
+    parent._office_edit_instruction = None
+    bound = getattr(parent, 'instruction_ticket', None)
+    if (session_root is not None and ticket is not None and callable(bound) and bound(plan) == ticket
+            and tracker.unchanged(ticket)):
+        parent._office_edit_instruction = {
+            'session_root': str(session_root), 'plan': deepcopy(plan), 'ticket': dict(ticket)}
+    return ticket
+
+
+def _continued_instruction(session, plan, binding):
+    """Only a verified preview continuing the exact locally submitted plan inherits it."""
+    from .computer import digest, read_record
+    if binding is None or binding['session_root'] != str(session.root):
+        return None
+    original = binding['plan']
+    saved = session.root / 'goals' / (original['sha256'] + '.json')
+    parent_run = session.root / 'goals' / (original['sha256'] + '.run')
+    approved_parent = str(parent_run)
+    if 'recovery' in original and not parent_run.exists():
+        # Re-previewing an unstarted continuation creates a sibling preview.
+        # Its exact verified parent remains the only permitted alternative.
+        approved_parent = original['recovery']['parent_run']
+    if (plan.get('recovery', {}).get('parent_run') != approved_parent
+            or plan.get('goal') != original.get('goal')
+            or plan.get('instruction') != original.get('instruction')
+            or digest(read_record(saved)) != digest(original)):
+        return None
+    return {'session_root': str(session.root), 'plan': deepcopy(plan),
+            'ticket': dict(binding['ticket'])}
+
+
 def open_panel(parent):
     from tkinter import Toplevel, ttk
     if parent.running or parent.external_busy() or parent.closed:
         return
+    from .computer import digest
     session, plan = parent.session, parent.plan
+    opened_parent_plan_sha256 = digest(plan)
+    historical_preview = not is_edit_plan(plan)
     try:
         current=adapter.current_candidate()
         if (adapter.DEFAULT_STORE/current).is_dir():
@@ -49,26 +99,76 @@ def open_panel(parent):
         parent.status.set('编辑适配器未就绪：'+str(exc))
         return
     candidate = state['candidate']
+    opened_plan_sha256 = digest(plan)
+    binding = getattr(parent, 'instruction_ticket', None)
+    opened_instruction_ticket = (binding(plan)
+        if not historical_preview and callable(binding) else None)
+    tracker = getattr(parent, 'instruction_draft', None)
+    opened_draft = tracker.snapshot() if tracker is not None else None
     window = Toplevel(parent.root)
     window.title('Jarvis · 保留格式编辑适配器')
     ttk.Label(window, text=describe_state(state), justify='left', padding=12).pack(fill='x')
 
-    def run(kind, operation):
+    def run(kind, operation, instruction_ticket=None):
         if parent.running or parent.external_busy() or parent.closed:
             return
         window.destroy()
-        parent.start(kind, lambda _: operation())
+        if instruction_ticket is not None:
+            parent.start_instruction(kind, lambda _: operation(), instruction_ticket)
+        else:
+            parent.start(kind, lambda _: operation())
+
+    def current_preview(*, refresh=False):
+        expected = (opened_parent_plan_sha256
+                    if refresh and historical_preview else opened_plan_sha256)
+        if (digest(parent.plan) != expected
+                or tracker is not None and not tracker.unchanged(opened_draft)
+                or opened_instruction_ticket is not None
+                and (not callable(binding) or binding(plan) != opened_instruction_ticket)):
+            parent.status.set('指令或差异预览已变化；旧试运行窗口已失效，请重新预览并打开编辑适配器。')
+            return False
+        return True
+
+    def refresh_preview():
+        if not current_preview(refresh=True):
+            return
+        from copy import deepcopy
+        provider = getattr(parent, 'office_planning_context', None)
+        guard = deepcopy(provider()) if callable(provider) else None
+        run('propose', lambda: {'plan': adapter.refresh_plan(session, plan),
+            'reason': '原修改内容已重新核验；请核对差异并批准。',
+            '_office_guard': guard}, opened_instruction_ticket)
 
     def execute_trial():
+        if not current_preview():
+            return
         pause = bool(parent.pause_each_step.get())
+        capture_instruction(parent, session, plan, opened_instruction_ticket)
         run('execute', lambda: adapter.trial(adapter.DEFAULT_STORE,candidate,session,plan,
             approval=plan['sha256'],stop=parent.stopped.is_set,
             progress=lambda p: parent.messages.put(('progress',p,None)),
-            pause_after_step=lambda:pause)['outcome'])
+            pause_after_step=lambda:pause)['outcome'], opened_instruction_ticket)
 
     def resume_preview():
-        result=adapter.prepare_resume(adapter.DEFAULT_STORE,candidate,session)
-        return {'plan':result['plan'],'reason':'已核对原生回执；只执行剩余编辑，请批准新预览。'}
+        if not current_preview(refresh=True):
+            return
+        # Capture Tk identity before the worker; it must never inspect widgets.
+        lineage = deepcopy(getattr(parent, '_office_edit_instruction', None))
+        if (lineage is not None and (tracker is None
+                or not tracker.unchanged(lineage['ticket']))):
+            lineage = None
+
+        def prepare():
+            from .computer_goal_panel import _InstructionResult
+            result=adapter.prepare_resume(adapter.DEFAULT_STORE,candidate,session)
+            response = {'plan':result['plan'],'reason':'已核对原生回执；只执行剩余编辑，请批准新预览。'}
+            continued = _continued_instruction(session, result['plan'], lineage)
+            if continued is not None:
+                parent._office_edit_instruction = continued
+                return _InstructionResult(response, continued['ticket'])
+            return response
+
+        run('propose', prepare)
 
     def adoption_request():
         result=adapter.prepare_adoption(adapter.DEFAULT_STORE,candidate,session,plan,
@@ -96,10 +196,10 @@ def open_panel(parent):
     actions = [
         ('运行离线检查', lambda: run('edit_adapter_state',lambda:(adapter.offline(adapter.DEFAULT_STORE,candidate),adapter.status(adapter.DEFAULT_STORE,candidate))[1])),
         ('批准当前差异并试运行',execute_trial),
-        ('预览未完成步骤',lambda:run('propose',resume_preview)),
+        ('预览未完成步骤',resume_preview),
         ('核验并限用 1 次',lambda:run('edit_adapter_state',lambda:adapter.activate(adapter.DEFAULT_STORE,candidate,runs=1))),
         ('成功后扩至总计 3 次',lambda:run('edit_adapter_state',lambda:adapter.activate(adapter.DEFAULT_STORE,candidate,runs=3))),
-        ('刷新原差异预览（不调用模型）',lambda:run('propose',lambda:{'plan':adapter.refresh_plan(session,plan),'reason':'原修改内容已重新核验；请核对差异并批准。'})),
+        ('刷新原差异预览（不调用模型）',refresh_preview),
     ]
     if is_edit_plan(plan) and 'recovery' in plan and adapter.owns_recovery(adapter.DEFAULT_STORE,session,plan) is None:
         actions = [

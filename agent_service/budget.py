@@ -27,6 +27,22 @@ class BudgetError(ValueError):
     """Invalid budget operation or insufficient budget."""
 
 
+def effective_limit(path, limited_micro=_MAX_LIMIT_MICRO):
+    """Read current production policy; custom ledgers remain independently limited.
+
+    This performs no SQLite opens or writes and never creates a ledger.
+    """
+    if type(limited_micro) is not int or not 0 < limited_micro <= _MAX_LIMIT_MICRO:
+        raise BudgetError('limit_micro must be an integer from 1 to 5,000,000')
+    if Path(path).resolve() != Path(DEFAULT_LEDGER).resolve():
+        return limited_micro
+    from .model_policy import budget_mode, read_permission, PermissionPolicyError
+    try:
+        return None if budget_mode(read_permission()) == 'unlimited' else limited_micro
+    except PermissionPolicyError as exc:
+        raise BudgetError(str(exc)) from None
+
+
 class BudgetLedger:
     def __init__(self, path=DEFAULT_LEDGER, limit_micro=5_000_000, clock=time.time):
         if type(limit_micro) is not int or not 0 < limit_micro <= _MAX_LIMIT_MICRO:
@@ -103,8 +119,9 @@ class BudgetLedger:
                 raise BudgetError("model budget accounting fault")
             now, day = self._now()
             held, daily, rolling = self._totals(db, now, day)
-            if (amount_micro > self.limit_micro - held - daily
-                    or amount_micro > self.limit_micro - held - rolling):
+            limit = effective_limit(self.path, self.limit_micro)
+            if limit is not None and (amount_micro > limit - held - daily
+                    or amount_micro > limit - held - rolling):
                 raise BudgetError("model budget exceeded")
             reservation_id = uuid.uuid4().hex
             db.execute("""INSERT INTO reservations
@@ -192,10 +209,14 @@ class BudgetLedger:
             now, day = self._now()
             held, daily, rolling = self._totals(db, now, day)
             faulted = db.execute("SELECT 1 FROM budget_faults LIMIT 1").fetchone() is not None
+            limit = effective_limit(self.path, self.limit_micro)
+            if limit is None:
+                return {'limit_micro': None, 'charged_micro': daily, 'held_micro': held,
+                        'remaining_micro': None, 'faulted': faulted}
             return {
-                "limit_micro": self.limit_micro,
+                "limit_micro": limit,
                 "charged_micro": daily,
                 "held_micro": held,
-                "remaining_micro": 0 if faulted else max(0, min(self.limit_micro - held - daily,
-                                                               self.limit_micro - held - rolling)),
+                "remaining_micro": 0 if faulted else max(0, min(limit - held - daily,
+                                                               limit - held - rolling)),
             }

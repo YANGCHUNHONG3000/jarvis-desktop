@@ -354,13 +354,15 @@ def _resume_preflight(steps, workflow_root):
 
 def run_office_workflow(steps, root: Path, *, execute=None, resume=False,
                         deadline=None, cancel_requested=None, cancel_file=None,
-                        resume_guard=None, result_root=None) -> dict:
+                        resume_guard=None, result_root=None, pause_after_step=False) -> dict:
     """Run an owned workflow; resume only verified receipts and fresh next steps.
 
     The injected executor takes (validated_spec, exact_step_directory, should_stop).
     The default executor is imported lazily so this module can be audited offline.
     """
     normalized = _steps(steps)
+    if type(pause_after_step) is not bool:
+        raise WorkflowError("pause_option_invalid")
     deadline = time.monotonic() + 600 if deadline is None else deadline
     try:
         finite_deadline = type(deadline) in (int, float) and math.isfinite(deadline)
@@ -490,6 +492,10 @@ def run_office_workflow(steps, root: Path, *, execute=None, resume=False,
                 # An RPC or save may have reached Office even if its response did not.
                 return partial("unknown", step=step["id"], error=type(exc).__name__)
             receipts[step["id"]] = receipt
+            if pause_after_step and step["id"] != normalized[-1]["id"]:
+                if stop():
+                    return partial("cancelled" if cancelled() else "timed_out")
+                return partial("cancelled", error="office_paused_after_verified_step")
         result = {"ok": True, "state": "succeeded", "root": str(workflow_root),
                   "completed": list(receipts), "receipts": receipts}
         return _finish(result_root or workflow_root, result)

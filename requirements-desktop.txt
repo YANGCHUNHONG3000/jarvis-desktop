@@ -9,3 +9,5 @@ tzdata==2026.2
 pywinauto==0.6.9; sys_platform == "win32"
 comtypes==1.4.17; sys_platform == "win32"
 pywin32==312; sys_platform == "win32"
+# Selected-window image annotation in the GUI host.
+pillow==11.3.0

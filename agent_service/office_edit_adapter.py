@@ -22,13 +22,20 @@ class AdapterError(ValueError):
 _ID = "office-copy-edit-v1"
 DEFAULT_STORE = ROOT / "data" / "office_edit_adapters"
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
-_SOURCES = ("office_edit.py", "office_edit_host.py", "office_intent.py", "action_choice_transport.py",
+_SOURCES = ("office_edit.py", "office_edit_host.py", "office_intent.py", "office_clarification.py",
+            "office_intent_recovery_panel.py", "office_task_chain_edit.py",
+            "office_chain_plan_binding.py", "office_task_chain_panel.py", "action_choice_transport.py",
             "office_scope.py", "computer_agent.py", "computer_interaction.py",
             "interaction_recovery.py", "office_handoff.py", "artifact_source.py",
             "edited_artifact_source.py", "office_source.py", "workbook_source.py",
             "office.py", "office_workflow.py", "computer.py", "computer_goals.py",
             "computer_agent_tools.py", "computer_goal_adapters.py", "run_lifecycle.py",
-            "office_edit_adapter.py", "office_edit_adapter_panel.py", "computer_goal_panel.py")
+            "office_edit_adapter.py", "office_edit_adapter_panel.py", "computer_goal_panel.py",
+            "instruction_draft.py", "mail_understanding.py", "mail_review_resume.py",
+            "windows_located_edit.py", "located_edit_workflow.py", "located_edit_panel.py",
+            "windows_content_query.py", "windows_task.py", "windows_handoff.py",
+            "windows_content_find.py", "windows_file_dialog.py", "windows_workbook_model.py",
+            "windows_document_copy.py", "office_edit_recheck.py")
 
 
 def implementation_sha256():
@@ -91,6 +98,8 @@ def _plan(session, plan, *, recovery=False):
         if root.parent != safe_root(session.root / "edit-inputs") or edit["after_browser"]:
             raise AdapterError("edit_adapter_source_invalid")
         _bind(edit["spec"], root)
+        from .computer_interaction import verify_location
+        verify_location(edit)
     if sum(len(edit["spec"]["changes"]) for edit in goal["edits"]) > 20:
         raise AdapterError("edit_adapter_change_limit")
     return goal
